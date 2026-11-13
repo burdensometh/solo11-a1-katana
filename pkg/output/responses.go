@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/utils/errkit"
 	urlutil "github.com/projectdiscovery/utils/url"
 )
@@ -52,12 +51,12 @@ func getResponseFile(storeResponseFolder, URL string) (string, *fileWriter, erro
 		return "", nil, err
 	}
 	fileName := getResponseFileName(storeResponseFolder, domain, URL)
-	output, err := newFileOutputWriter(fileName)
+	output, err := os.OpenFile(fileName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return "", nil, errkit.Wrap(err, "output: could not create output file")
 	}
 
-	return fileName, output, nil
+	return fileName, newOneShotFileWriter(output), nil
 }
 
 func getResponseFileName(storeResponseFolder, domain, URL string) string {
@@ -66,17 +65,12 @@ func getResponseFileName(storeResponseFolder, domain, URL string) string {
 	return filepath.Join(folder, file)
 }
 
-func updateIndex(storeResponseFolder string, result *Result) error {
-	index, err := os.OpenFile(filepath.Join(storeResponseFolder, indexFile), os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
+// updateIndex appends an entry to the response index through the writer's
+// single persistent file handle, avoiding an open/close per result.
+func (w *StandardWriter) updateIndex(result *Result) error {
+	if w.indexFile == nil {
+		return nil
 	}
-
-	defer func() {
-		if err := index.Close(); err != nil {
-			gologger.Error().Msgf("Error closing index: %v\n", err)
-		}
-	}()
 
 	builder := &bytes.Buffer{}
 
@@ -85,14 +79,13 @@ func updateIndex(storeResponseFolder string, result *Result) error {
 		return err
 	}
 
-	builder.WriteString(getResponseFileName(storeResponseFolder, domain, result.Request.URL))
+	builder.WriteString(getResponseFileName(w.storeResponseDir, domain, result.Request.URL))
 	builder.WriteRune(' ')
 	builder.WriteString(result.Request.URL)
 	builder.WriteRune(' ')
 	builder.WriteString("(" + result.Response.Resp.Status + ")")
-	builder.WriteRune('\n')
 
-	if _, writeErr := index.Write(builder.Bytes()); writeErr != nil {
+	if err := w.indexFile.Write(builder.Bytes()); err != nil {
 		return errkit.Wrap(err, "output: could not update index")
 	}
 

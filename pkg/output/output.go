@@ -60,6 +60,9 @@ type StandardWriter struct {
 	omitRaw               bool
 	omitBody              bool
 	errorFile             *fileWriter
+	indexFile             *fileWriter
+	fieldWriters          map[string]*fileWriter
+	fieldWritersMu        sync.Mutex
 	matchRegex            []*regexp.Regexp
 	filterRegex           []*regexp.Regexp
 	extensionValidator    *extensions.Validator
@@ -92,6 +95,7 @@ func New(options Options) (Writer, error) {
 		outputFilterCondition: options.OutputFilterCondition,
 		excludeOutputFields:   options.ExcludeOutputFields,
 		filterPageType:        options.FilterPageType,
+		fieldWriters:          make(map[string]*fileWriter),
 	}
 
 	if options.StoreFieldDir != "" {
@@ -148,20 +152,21 @@ func New(options Options) (Writer, error) {
 		} else {
 			_ = os.MkdirAll(writer.storeResponseDir, os.ModePerm)
 		}
-		// Pre-create or open index file. For custom or no-clobber dirs, keep index additive.
+		// Open the index file once and keep the handle for the whole run.
+		// For custom or no-clobber dirs, keep index additive.
 		indexPath := filepath.Join(writer.storeResponseDir, indexFile)
-		flags := os.O_CREATE | os.O_WRONLY
 		if options.NoClobber || isCustomDir {
-			flags |= os.O_APPEND
+			indexWriter, err := newAppendFileOutputWriter(indexPath)
+			if err != nil {
+				return nil, errkit.Wrap(err, "output: could not create index file")
+			}
+			writer.indexFile = indexWriter
 		} else {
-			flags |= os.O_TRUNC
-		}
-		f, err := os.OpenFile(indexPath, flags, 0644)
-		if err != nil {
-			return nil, errkit.Wrap(err, "output: could not create index file")
-		}
-		if cerr := f.Close(); cerr != nil {
-			return nil, errkit.Wrap(cerr, "output: could not close index file")
+			indexWriter, err := newFileOutputWriter(indexPath)
+			if err != nil {
+				return nil, errkit.Wrap(err, "output: could not create index file")
+			}
+			writer.indexFile = indexWriter
 		}
 	}
 	if options.ErrorLogFile != "" {
@@ -193,7 +198,7 @@ func (w *StandardWriter) Write(result *Result) error {
 	}
 
 	if len(w.storeFields) > 0 {
-		storeFields(result, w.storeFields)
+		w.storeResultFields(result, w.storeFields)
 	}
 
 	if !w.extensionValidator.ValidatePath(result.Request.URL) {
@@ -228,7 +233,7 @@ func (w *StandardWriter) Write(result *Result) error {
 			if err != nil {
 				return errkit.Wrap(err, "output: could not store response")
 			}
-			if err := updateIndex(w.storeResponseDir, result); err != nil {
+			if err := w.updateIndex(result); err != nil {
 				return errkit.Wrap(err, "output: could not store response")
 			}
 			if err := fileWriter.Write(data); err != nil {
@@ -324,21 +329,26 @@ func (w *StandardWriter) WriteErr(errMessage *Error) error {
 	return nil
 }
 
-// Close closes the output writer
+// Close closes the output writer, forcing a final flush of every
+// persistent file handle before the process exits.
 func (w *StandardWriter) Close() error {
+	var err error
 	if w.outputFile != nil {
-		err := w.outputFile.Close()
-		if err != nil {
-			return err
-		}
+		err = errors.Join(err, w.outputFile.Close())
 	}
 	if w.errorFile != nil {
-		err := w.errorFile.Close()
-		if err != nil {
-			return err
-		}
+		err = errors.Join(err, w.errorFile.Close())
 	}
-	return nil
+	if w.indexFile != nil {
+		err = errors.Join(err, w.indexFile.Close())
+	}
+	w.fieldWritersMu.Lock()
+	for _, fw := range w.fieldWriters {
+		err = errors.Join(err, fw.Close())
+	}
+	w.fieldWriters = nil
+	w.fieldWritersMu.Unlock()
+	return err
 }
 
 // GetResultCount returns the number of results written

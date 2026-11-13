@@ -3,11 +3,9 @@ package output
 import (
 	"fmt"
 	"net/url"
-	"os"
 	"path"
 	"strings"
 
-	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/utils/errkit"
 	stringsutil "github.com/projectdiscovery/utils/strings"
 	urlutil "github.com/projectdiscovery/utils/url"
@@ -58,44 +56,55 @@ func validateFieldNames(names string) error {
 	return nil
 }
 
-// storeFields stores fields for a result into individual files
-// based on name.
-func storeFields(output *Result, storeFields []string) {
+// storeResultFields stores fields for a result into individual files
+// based on name. Each destination file is opened once and kept open for
+// the lifetime of the writer instead of opening/closing per result.
+func (w *StandardWriter) storeResultFields(output *Result, fields []string) {
 	parsed, err := urlutil.Parse(output.Request.URL)
 	if err != nil {
-		gologger.Warning().Msgf("storeFields: failed to parse url %v got %v", output.Request.URL, err)
 		return
 	}
 
 	hostname := parsed.Hostname()
 	etld, _ := publicsuffix.EffectiveTLDPlusOne(hostname)
 	rootURL := fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host)
-	for _, field := range storeFields {
+	for _, field := range fields {
 		if result := getValueForField(output, parsed.URL, hostname, etld, rootURL, field); result != "" {
-			appendToFileField(parsed.URL, field, result)
+			w.appendToFileField(parsed.URL, field, result)
 		}
 		if hasCustomField(field) {
 			results := getValueForCustomField(output)
 			for _, result := range results {
-				appendToFileField(parsed.URL, result.field, result.value)
+				w.appendToFileField(parsed.URL, result.field, result.value)
 			}
 		}
 	}
 }
 
-func appendToFileField(parsed *url.URL, field, data string) {
-	file, err := os.OpenFile(path.Join(storeFieldDir, fmt.Sprintf("%s_%s_%s.txt", parsed.Scheme, parsed.Hostname(), field)), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+// fieldFileWriter returns the persistent buffered writer for a field file,
+// opening it once on first use and reusing the handle afterwards.
+func (w *StandardWriter) fieldFileWriter(file string) (*fileWriter, error) {
+	w.fieldWritersMu.Lock()
+	defer w.fieldWritersMu.Unlock()
+
+	if fw, ok := w.fieldWriters[file]; ok {
+		return fw, nil
+	}
+	fw, err := newAppendFileOutputWriter(file)
+	if err != nil {
+		return nil, err
+	}
+	w.fieldWriters[file] = fw
+	return fw, nil
+}
+
+func (w *StandardWriter) appendToFileField(parsed *url.URL, field, data string) {
+	file := path.Join(storeFieldDir, fmt.Sprintf("%s_%s_%s.txt", parsed.Scheme, parsed.Hostname(), field))
+	fw, err := w.fieldFileWriter(file)
 	if err != nil {
 		return
 	}
-	defer func() {
-		if err := file.Close(); err != nil {
-			gologger.Error().Msgf("Error closing file: %v\n", err)
-		}
-	}()
-
-	_, _ = file.WriteString(data)
-	_, _ = file.Write([]byte("\n"))
+	_ = fw.Write([]byte(data))
 }
 
 // formatField formats output results based on fields from fieldNames
