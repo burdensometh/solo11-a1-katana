@@ -79,6 +79,8 @@ func (l *Lab) register(mux *http.ServeMux) {
 	mux.HandleFunc("/", l.handleHome)
 	mux.HandleFunc("/about-public", l.handleAboutPublic)
 	mux.HandleFunc("/login", l.handleLogin)
+	mux.HandleFunc("/login/redesign", l.handleLoginRedesign)
+	mux.HandleFunc("/login/redesign/structure", l.handleLoginRedesignStructure)
 	mux.HandleFunc("/login/step", l.handleLoginStep)
 	mux.HandleFunc("/login/spa", l.handleLoginSPA)
 	mux.HandleFunc("/api/login", l.handleAPILogin)
@@ -175,6 +177,53 @@ func (l *Lab) handleLogin(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// handleLoginRedesign serves a post-redesign login page. The recorded flow
+// was authored against the old #email/#password/#submit ids, which are all
+// gone here: fields are anonymous generated classes, so replay must recover
+// via label text (email, submit) and adjacent DOM structure (the password
+// control sits in the row immediately after the email control). The form
+// still posts email/password to /login so the server side is unchanged.
+func (l *Lab) handleLoginRedesign(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = fmt.Fprint(w, `<!DOCTYPE html>
+<html><head><title>Sign in</title></head>
+<body>
+  <h1>Welcome back</h1>
+  <form method="POST" action="/login">
+    <div class="a1b2c3">
+      <label for="ctrl-7f">Email</label>
+      <input id="ctrl-7f" class="x9z" name="email" type="email" />
+    </div>
+    <div class="a1b2c3">
+      <span class="m4n">Secret</span>
+      <input class="x9z k2l" name="password" type="password" />
+    </div>
+    <div class="a1b2c3">
+      <button class="p8q" type="submit">Sign in</button>
+    </div>
+  </form>
+</body></html>`)
+}
+
+// handleLoginRedesignStructure serves a hostile redesign with no label text
+// whatsoever: anonymous generated ids/classes, no labels, no aria attributes.
+// The recorded #email/#password/#submit selectors are all dead. The email
+// control can still be inferred from its input type; the password control
+// additionally has no semantic name/id, so only the sibling rule can find it;
+// and the empty textless button likewise falls back to structural matching.
+func (l *Lab) handleLoginRedesignStructure(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = fmt.Fprint(w, `<!DOCTYPE html>
+<html><head><title>Portal</title></head>
+<body>
+  <form method="POST" action="/login">
+    <div class="q7w"><input id="f-100" class="e3r" name="email" type="email" /></div>
+    <div class="q7w"><input id="f-101" class="e3r t5y" name="password" type="password" /></div>
+    <div class="q7w"><button id="f-102" class="u6i" type="submit"></button></div>
+  </form>
+</body></html>`)
 }
 
 // handleLoginStep serves a username-first flow entirely client-side so a
@@ -382,4 +431,52 @@ func ExplicitStepsSimple(baseURL string) string {
     {"action": "click", "selector": "#submit"}
   ]
 }`, baseURL+"/login")
+}
+
+// ExplicitStepsRedesign replays the OLD recorded selectors against the
+// redesigned /login/redesign page, where every recorded id is gone. It drives
+// all three resolution rules: email via label text, password via the previous
+// element's sibling structure, and the submit button via its text.
+func ExplicitStepsRedesign(baseURL string) string {
+	baseURL = strings.TrimRight(baseURL, "/")
+	return fmt.Sprintf(`{
+  "steps": [
+    {"action": "navigate", "value": %q},
+    {"action": "fill", "selector": "#email", "value": "{{username}}"},
+    {"action": "fill", "selector": "#password", "value": "{{password}}"},
+    {"action": "click", "selector": "#submit"}
+  ]
+}`, baseURL+"/login/redesign")
+}
+
+// ExplicitStepsStructureOnly is a hand-authored flow for a redesigned login
+// page whose anonymous inputs have no labels at all. Both fields can only be
+// recovered from the DOM structure relative to the previously matched
+// element, so it exercises the sibling rule twice in a row.
+func ExplicitStepsStructureOnly(baseURL string) string {
+	baseURL = strings.TrimRight(baseURL, "/")
+	return fmt.Sprintf(`{
+  "steps": [
+    {"action": "navigate", "value": %q},
+    {"action": "fill", "selector": "#email", "value": "{{username}}"},
+    {"action": "fill", "selector": "#password", "value": "{{password}}"},
+    {"action": "click", "selector": "#submit"}
+  ]
+}`, baseURL+"/login/redesign/structure")
+}
+
+// ChromeRecordingRedesign is the Chrome Recorder export equivalent of
+// ExplicitStepsRedesign, proving the fallback path also works for recordings
+// compiled through pickSelector rather than hand-authored flows.
+func ChromeRecordingRedesign(baseURL string) string {
+	baseURL = strings.TrimRight(baseURL, "/")
+	return fmt.Sprintf(`{
+  "title": "authlab redesigned login (recorded before the redesign)",
+  "steps": [
+    {"type": "navigate", "url": %q},
+    {"type": "change", "value": %q, "selectors": [["#email"], ["aria/Email"]]},
+    {"type": "change", "value": %q, "selectors": [["#password"], ["aria/Password"]]},
+    {"type": "click", "selectors": [["#submit"], ["aria/Sign in"]]}
+  ]
+}`, baseURL+"/login/redesign", Username, Password)
 }

@@ -844,6 +844,30 @@ cookies or web storage, end an explicit flow with `waitvisible` targeting an
 element that only exists after login. A successful terminal visibility check is
 treated as the flow's explicit authentication assertion.
 
+#### Surviving a login-page redesign
+
+A site redesign often changes the ids/classes a flow was recorded against, so
+the recorded selector no longer matches. Instead of failing the whole flow with
+an opaque "step failed", each element-bearing step resolves through three
+strategies, in order:
+
+1. **Recorded selector** — the original CSS/XPath (and the `input[name=…]`
+   shorthand) is tried first and used unchanged when it still matches.
+2. **Label text** — on a miss, the control is located by its visible `<label>`
+   text, `aria-label`, `placeholder`, or button text. Chrome Recorder `aria/`
+   and `text/` alternatives are carried over as label hints; for controls with
+   no visible label, the input's semantic type/name (`type=email`,
+   `type=password`, `autocomplete`, …) is used.
+3. **Adjacent structure** — if label matching also fails, the element is
+   reconstructed relative to the previous element the flow successfully
+   interacted with (other controls in the same field row, then following /
+   preceding sibling inputs within a bounded number of parent containers).
+
+Which rule actually located each element is recorded on the step as
+`match_rule` (`selector`, `label`, or `sibling`) with a `matched_selector`
+description of the resolved element, and every fallback hit is emitted as a
+warning log so a redesign-induced selector break is visible rather than silent.
+
 > Recorded flows require **pure headless** (`-hl`). Hybrid (`-hh`) is disabled automatically when `-rf` is set.
 
 There are more options to configure when needed, here is all the config related CLI options - 

@@ -28,8 +28,8 @@ func TestStepsFromRecording_MapsAndParameterizes(t *testing.T) {
 
 	require.Equal(t, []LoginStep{
 		{Action: "navigate", Value: "https://app.example.com/login"},
-		{Action: "fill", Selector: "#email", Value: "{{username}}"},
-		{Action: "click", Selector: "#next"},
+		{Action: "fill", Selector: "#email", LabelHints: []string{"Email"}, Value: "{{username}}"},
+		{Action: "click", Selector: "#next", LabelHints: []string{"Next"}},
 		{Action: "waitvisible", Selector: "#password"},
 		{Action: "fill", Selector: "#password", Value: "{{password}}"},
 		{Action: "press", Value: "enter"},

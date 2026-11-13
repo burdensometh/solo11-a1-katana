@@ -18,9 +18,23 @@ type LoginStep struct {
 	// Selector is a CSS selector (or xpath=… expression) the action targets.
 	// Unused by navigate/wait.
 	Selector string `json:"selector" yaml:"selector"`
+	// LabelHints are human-readable texts captured alongside the selector in a
+	// recording (Chrome's aria/text alternative selectors), such as "Sign in"
+	// or "Email address". They feed the label-text fallback tier when the
+	// selector goes stale after a site redesign. Hand-authored flows leave this
+	// empty and rely on keywords derived from the selector instead.
+	LabelHints []string `json:"label_hints,omitempty" yaml:"label_hints,omitempty"`
 	// Value is the action argument: a URL (navigate), text to type (fill), a key
 	// name such as "enter"/"tab" (press), or a duration like "2s" (wait).
 	Value string `json:"value" yaml:"value"`
+	// MatchRule records which selector strategy actually located the element on
+	// the last replay. It is populated by the resolver (not read from flow
+	// files), so users can see which fallback absorbed a site redesign:
+	// "selector", "label", or "sibling".
+	MatchRule string `json:"match_rule,omitempty" yaml:"match_rule,omitempty"`
+	// MatchedSelector is a best-effort description of the element the winning
+	// rule resolved to (tag/id/name), for diagnostics alongside MatchRule.
+	MatchedSelector string `json:"matched_selector,omitempty" yaml:"matched_selector,omitempty"`
 }
 
 // FirstNavigateURL returns the first absolute HTTP(S) navigate URL, or "".

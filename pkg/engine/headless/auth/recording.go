@@ -133,28 +133,29 @@ func StepsFromRecording(data []byte, username, password string) ([]LoginStep, er
 			if sel == "" {
 				return nil, errkit.Newf("recorded-flow: recording step %d (%s) has no supported selector", i, stepType)
 			}
-			steps = append(steps, LoginStep{Action: stepType, Selector: sel})
+			steps = append(steps, LoginStep{Action: stepType, Selector: sel, LabelHints: labelHints(rs.Selectors)})
 		case "change":
 			sel := pickSelector(rs.Selectors)
 			if sel == "" {
 				return nil, errkit.Newf("recorded-flow: recording step %d (change) has no supported selector", i)
 			}
 			steps = append(steps, LoginStep{
-				Action:   "fill",
-				Selector: sel,
-				Value:    parameterizeValue(rs.Value, sel, username, password),
+				Action:     "fill",
+				Selector:   sel,
+				LabelHints: labelHints(rs.Selectors),
+				Value:      parameterizeValue(rs.Value, sel, username, password),
 			})
 		case "keydown":
 			// Character keys are captured by `change`; ignore paired keyUp.
 			if key := normalizeKey(rs.Key); key != "" {
-				steps = append(steps, LoginStep{Action: "press", Value: key, Selector: pickSelector(rs.Selectors)})
+				steps = append(steps, LoginStep{Action: "press", Value: key, Selector: pickSelector(rs.Selectors), LabelHints: labelHints(rs.Selectors)})
 			}
 		case "waitforelement":
 			sel := pickSelector(rs.Selectors)
 			if sel == "" {
 				return nil, errkit.Newf("recorded-flow: recording step %d (waitForElement) has no supported selector", i)
 			}
-			steps = append(steps, LoginStep{Action: "waitvisible", Selector: sel})
+			steps = append(steps, LoginStep{Action: "waitvisible", Selector: sel, LabelHints: labelHints(rs.Selectors)})
 		case "waitforexpression":
 			// Arbitrary expressions are not evaluated; settle instead.
 			steps = append(steps, LoginStep{Action: "wait"})
@@ -240,7 +241,18 @@ func looksLikePasswordSelector(selector string) bool {
 // pickSelector prefers native CSS, then XPath, then aria-label CSS, then text XPath.
 // Shadow-piercing (pierce/) selectors are skipped.
 func pickSelector(groups [][]string) string {
-	var css, xpath, aria, text string
+	css, xpath, aria, text := splitSelectors(groups)
+	for _, candidate := range []string{css, xpath, aria, text} {
+		if candidate != "" {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// splitSelectors classifies the recorded alternative selectors into the four
+// engine-supported strategies.
+func splitSelectors(groups [][]string) (css, xpath, aria, text string) {
 	for _, group := range groups {
 		for _, s := range group {
 			s = strings.TrimSpace(s)
@@ -268,12 +280,40 @@ func pickSelector(groups [][]string) string {
 			}
 		}
 	}
-	for _, candidate := range []string{css, xpath, aria, text} {
-		if candidate != "" {
-			return candidate
+	return css, xpath, aria, text
+}
+
+// labelHints extracts the human-readable text from Chrome's aria/ and text/
+// alternative selectors. These are the labels a human sees ("Sign in",
+// "Email address") and are the most resilient anchors after a redesign, so the
+// label fallback tier tries them before keywords guessed from the CSS/XPath.
+func labelHints(groups [][]string) []string {
+	var hints []string
+	seen := map[string]struct{}{}
+	add := func(prefix, s string) {
+		value := strings.TrimSpace(strings.TrimPrefix(s, prefix))
+		if value == "" || strings.Contains(value, `"`) {
+			return
+		}
+		key := strings.ToLower(value)
+		if _, dup := seen[key]; dup {
+			return
+		}
+		seen[key] = struct{}{}
+		hints = append(hints, value)
+	}
+	for _, group := range groups {
+		for _, s := range group {
+			s = strings.TrimSpace(s)
+			switch {
+			case strings.HasPrefix(s, "aria/"):
+				add("aria/", s)
+			case strings.HasPrefix(s, "text/"):
+				add("text/", s)
+			}
 		}
 	}
-	return ""
+	return hints
 }
 
 func ariaToCSS(name string) string {

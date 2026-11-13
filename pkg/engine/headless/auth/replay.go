@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -30,6 +31,19 @@ func RunLoginSteps(ctx context.Context, page *rod.Page, steps []LoginStep, usern
 		settle = defaultSettle
 	}
 
+	// The resolver keeps the original selector as the first strategy but
+	// absorbs a login-page redesign by falling back to label-text and then
+	// sibling-structure matching; MatchRule on each step records which rule
+	// actually hit. It is created lazily after the first navigation so the
+	// injected DOM helpers are not wiped by the about:blank → login load.
+	var resolver *stepResolver
+	ensureResolver := func() *stepResolver {
+		if resolver == nil {
+			resolver = newStepResolver(page)
+		}
+		return resolver
+	}
+
 	for i, step := range steps {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -52,18 +66,21 @@ func RunLoginSteps(ctx context.Context, page *rod.Page, steps []LoginStep, usern
 				// the following steps decide whether the flow really broke.
 			}
 		case "fill", "input", "type":
-			el := findVisible(stepPage, byName(step.Selector), step.Selector)
-			if el == nil {
+			result := ensureResolver().Resolve(i, step, action)
+			if result == nil {
 				return errkit.Newf("recorded-flow step %d (fill): element not found: %s", i, step.Selector)
 			}
-			if err := typeInto(el, ExpandCredentials(step.Value, username, password)); err != nil {
+			recordMatch(&steps[i], result)
+			if err := typeInto(result.el, ExpandCredentials(step.Value, username, password)); err != nil {
 				return errkit.Wrapf(err, "recorded-flow step %d (fill): failed", i)
 			}
 		case "click", "doubleclick":
-			el := findVisible(stepPage, step.Selector)
-			if el == nil {
+			result := ensureResolver().Resolve(i, step, action)
+			if result == nil {
 				return errkit.Newf("recorded-flow step %d (%s): element not found: %s", i, action, step.Selector)
 			}
+			recordMatch(&steps[i], result)
+			el := result.el
 			_ = el.ScrollIntoView()
 			clickCount := 1
 			if action == "doubleclick" {
@@ -73,7 +90,7 @@ func RunLoginSteps(ctx context.Context, page *rod.Page, steps []LoginStep, usern
 				return errkit.Wrapf(err, "recorded-flow step %d (%s): failed", i, action)
 			}
 		case "waitvisible":
-			if err := waitVisible(ctx, stepPage, step.Selector, settle); err != nil {
+			if err := waitVisibleWithResolver(ctx, ensureResolver(), i, &steps[i], settle); err != nil {
 				return errkit.Wrapf(err, "recorded-flow step %d (waitvisible)", i)
 			}
 		case "wait":
@@ -94,28 +111,35 @@ func RunLoginSteps(ctx context.Context, page *rod.Page, steps []LoginStep, usern
 				return errkit.Wrapf(kerr, "recorded-flow step %d (press)", i)
 			}
 			if step.Selector != "" {
-				el := findVisible(stepPage, byName(step.Selector), step.Selector)
-				if el == nil {
+				result := ensureResolver().Resolve(i, step, action)
+				if result == nil {
 					return errkit.Newf("recorded-flow step %d (press): element not found: %s", i, step.Selector)
 				}
-				if err := el.Type(key); err != nil {
+				recordMatch(&steps[i], result)
+				if err := result.el.Type(key); err != nil {
 					return errkit.Wrapf(err, "recorded-flow step %d (press): failed", i)
 				}
 			} else if err := stepPage.Keyboard.Type(key); err != nil {
 				return errkit.Wrapf(err, "recorded-flow step %d (press): failed", i)
 			}
 		case "submit":
-			fallback := findVisible(stepPage, `input[type="password"]`)
+			var target *rod.Element
 			if step.Selector != "" {
-				if el := findVisible(stepPage, byName(step.Selector), step.Selector); el != nil {
-					fallback = el
-					_ = el.ScrollIntoView()
-					if err := el.Click(proto.InputMouseButtonLeft, 1); err == nil {
+				if result := ensureResolver().Resolve(i, step, action); result != nil {
+					recordMatch(&steps[i], result)
+					target = result.el
+					_ = target.ScrollIntoView()
+					if err := target.Click(proto.InputMouseButtonLeft, 1); err == nil {
 						break
 					}
 				}
 			}
-			if err := submitForm(stepPage, fallback, settle); err != nil {
+			if target == nil {
+				// No usable recorded selector: keep the historical generic
+				// password-field / submit-control behavior.
+				target = findVisible(stepPage, `input[type="password"]`)
+			}
+			if err := submitForm(stepPage, target, settle); err != nil {
 				return errkit.Wrapf(err, "recorded-flow step %d (submit)", i)
 			}
 		default:
@@ -123,7 +147,58 @@ func RunLoginSteps(ctx context.Context, page *rod.Page, steps []LoginStep, usern
 		}
 		_ = rod.Try(func() { stepPage.Timeout(settle).MustWaitStable() })
 	}
+
+	if resolver != nil {
+		logFallbackMatches(resolver.Matches())
+	}
 	return nil
+}
+
+// recordMatch stamps the winning strategy back onto the step so callers and
+// flow-file dumps can show how the element was found after a redesign.
+func recordMatch(step *LoginStep, result *resolveResult) {
+	if step == nil || result == nil {
+		return
+	}
+	step.MatchRule = result.rule
+	step.MatchedSelector = result.resolved
+}
+
+// logFallbackMatches emits one diagnostic line per step that only succeeded
+// through a fallback rule, so a redesign-induced selector break is visible
+// instead of surfacing as an opaque "step failed".
+func logFallbackMatches(matches []Match) {
+	for _, m := range matches {
+		if m.Rule == MatchRuleSelector {
+			continue
+		}
+		loginLog.Warn("recorded-flow: recorded selector failed; element located via fallback rule",
+			slog.Int("step", m.StepIndex),
+			slog.String("rule", m.Rule),
+			slog.String("recorded_selector", m.Selector),
+			slog.String("resolved_element", m.Resolved),
+		)
+	}
+}
+
+// waitVisibleWithResolver polls until the step's element appears. The original
+// selector stays the fast path (tier 1 inside the resolver); once it goes stale
+// the label/sibling fallbacks run so a redesigned page can still satisfy the
+// visibility assertion.
+func waitVisibleWithResolver(ctx context.Context, resolver *stepResolver, stepIndex int, step *LoginStep, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if result := resolver.Resolve(stepIndex, *step, "waitvisible"); result != nil {
+			recordMatch(step, result)
+			return nil
+		}
+		select {
+		case <-time.After(150 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return errkit.Newf("timeout waiting for element to become visible: %s", step.Selector)
 }
 
 func keyFromName(name string) (input.Key, error) {
@@ -139,21 +214,6 @@ func keyFromName(name string) (input.Key, error) {
 	default:
 		return 0, errkit.Newf("unsupported key %q (supported: enter, tab, escape, space)", name)
 	}
-}
-
-func waitVisible(ctx context.Context, page *rod.Page, selector string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if findVisible(page, selector) != nil {
-			return nil
-		}
-		select {
-		case <-time.After(150 * time.Millisecond):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	return errkit.Newf("timeout waiting for element to become visible: %s", selector)
 }
 
 func submitForm(page *rod.Page, fallbackField *rod.Element, settle time.Duration) error {
