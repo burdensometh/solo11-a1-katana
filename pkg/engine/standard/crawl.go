@@ -98,6 +98,27 @@ func (c *Crawler) makeRequest(s *common.CrawlSession, request *navigation.Reques
 		return response, err
 	}
 
+	// An expired crawl session turns every response into the same login page,
+	// which the content dedup below would silently swallow. Probe before
+	// dedup and return the full response so the crawl loop can re-login and
+	// re-queue the request.
+	if c.SessionGuard != nil {
+		probe := &navigation.Response{
+			Depth:        response.Depth,
+			RootHostname: response.RootHostname,
+			Resp:         resp,
+			StatusCode:   resp.StatusCode,
+			Body:         string(data),
+		}
+		if doc, docErr := goquery.NewDocumentFromReader(bytes.NewReader(data)); docErr == nil {
+			probe.Reader = doc
+		}
+		if c.SessionGuard.IsLoginResponse(request, probe) {
+			resp.Body = io.NopCloser(strings.NewReader(string(data)))
+			return probe, nil
+		}
+	}
+
 	// Skip unique content filtering if disabled
 	if !c.Options.Options.DisableUniqueFilter {
 		if !c.Options.UniqueFilter.UniqueContent(data) {

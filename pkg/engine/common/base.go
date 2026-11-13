@@ -3,19 +3,21 @@ package common
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"math"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/go-rod/rod"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/katana/pkg/engine/parser/files"
 	"github.com/projectdiscovery/katana/pkg/navigation"
@@ -46,13 +48,16 @@ type hostBackoff struct {
 const hostBackoffsCacheSize = 10000
 
 type Shared struct {
-	Headers            map[string]string
-	KnownFiles         *files.KnownFiles
-	Options            *types.CrawlerOptions
-	Jar                *httputil.CookieJar
-	PathTrie           *utils.PathTrie
+	Headers           map[string]string
+	KnownFiles        *files.KnownFiles
+	Options           *types.CrawlerOptions
+	Jar               *httputil.CookieJar
+	PathTrie          *utils.PathTrie
 	DomainPageCounter sync.Map
-	hostBackoffs *lru.Cache[string, *hostBackoff]
+	hostBackoffs      *lru.Cache[string, *hostBackoff]
+	// SessionGuard detects expired authenticated sessions from responses and
+	// re-establishes them single-flight. Nil when no credentials are configured.
+	SessionGuard *SessionGuard
 }
 
 // NewShared creates a new Shared instance with the provided crawler options.
@@ -82,6 +87,33 @@ func NewShared(options *types.CrawlerOptions) (*Shared, error) {
 		return nil, errkit.Wrap(err, "could not create cookie jar")
 	}
 	shared.Jar = jar
+
+	// Arm the session guard for authenticated crawls so an expired session is
+	// noticed on the first login-page response instead of after hours of
+	// crawling login walls.
+	if creds := options.Options.AuthCredentials; creds != "" {
+		username, password, _ := strings.Cut(creds, ":")
+		loginClient, _, err := BuildHttpClient(options.Dialer, options.Options, nil)
+		if err != nil {
+			return nil, errkit.Wrap(err, "could not create login http client")
+		}
+		// The login client shares the crawl jar, so a fresh session is
+		// immediately visible to every worker, and always follows redirects
+		// (login chains often bounce through an SSO) regardless of the
+		// crawl's redirect policy.
+		loginClient.HTTPClient.Jar = jar
+		loginClient.HTTPClient.CheckRedirect = nil
+		if loginClient.HTTPClient2 != nil {
+			loginClient.HTTPClient2.Jar = jar
+			loginClient.HTTPClient2.CheckRedirect = nil
+		}
+		formLogin := &HTTPFormLogin{
+			Client:   loginClient,
+			Username: username,
+			Password: password,
+		}
+		shared.SessionGuard = NewSessionGuard(formLogin.Login)
+	}
 
 	if options.Options.FilterSimilar {
 		shared.PathTrie = utils.NewPathTrie(options.Options.FilterSimilarThreshold)
@@ -122,6 +154,13 @@ func (s *Shared) Enqueue(queue *queue.Queue, navigationRequests ...*navigation.R
 		}
 
 		if (s.Options.Options.AuthCredentials != "" || s.Options.Options.RecordedFlow != "") && isLogoutURL(nr.URL) {
+			continue
+		}
+
+		// Login pages are crawl machinery, not content: when the session
+		// guard manages authentication, never enqueue them (they are
+		// discovered from redirect stubs pointing at the login page).
+		if s.SessionGuard != nil && isLoginURL(nr.URL) {
 			continue
 		}
 
@@ -395,6 +434,9 @@ func (s *Shared) NewCrawlSessionWithURL(URL string) (*CrawlSession, error) {
 		Queue:      queue,
 		HttpClient: httpclient,
 	}
+	if s.SessionGuard != nil {
+		s.SessionGuard.BindStop(cancel)
+	}
 	return crawlSession, nil
 }
 
@@ -508,7 +550,35 @@ func (s *Shared) Do(crawlSession *CrawlSession, doRequest DoRequestFunc) error {
 				}
 			}
 
+			var sessionGen uint64
+			if s.SessionGuard != nil {
+				sessionGen = s.SessionGuard.Generation()
+			}
+
 			resp, err := doRequest(crawlSession, req)
+
+			// Expired session: every response is a login page. Refresh the
+			// session single-flight and re-queue the request so its real
+			// content is fetched with the fresh session instead of emitting
+			// the login page as a result.
+			if s.SessionGuard != nil && err == nil && s.SessionGuard.IsLoginResponse(req, resp) {
+				gerr := s.SessionGuard.EnsureSession(crawlSession.Ctx, sessionGen)
+				if errors.Is(gerr, ErrSessionCircuitOpen) {
+					gologger.Error().Msgf("stopping crawl: %s", gerr)
+					crawlSession.CancelFunc()
+					return
+				}
+				if gerr != nil && crawlSession.Ctx.Err() != nil {
+					return
+				}
+				if req.SessionRetries < maxSessionRequeues {
+					req.SessionRetries++
+					crawlSession.Queue.Push(req, s.priority(req))
+				} else if inScope {
+					s.Output(req, resp, nil)
+				}
+				return
+			}
 
 			if resp != nil && IsThrottled(resp.StatusCode) {
 				s.RecordThrottle(crawlSession.Hostname, resp.StatusCode)
@@ -543,5 +613,8 @@ func (s *Shared) Do(crawlSession *CrawlSession, doRequest DoRequestFunc) error {
 		}()
 	}
 	wg.Wait()
+	if s.SessionGuard != nil && s.SessionGuard.Tripped() {
+		return s.SessionGuard.TripError()
+	}
 	return crawlSession.Ctx.Err()
 }

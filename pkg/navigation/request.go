@@ -22,6 +22,9 @@ type Request struct {
 	Source         string              `json:"source,omitempty"`
 	CustomFields   map[string][]string `json:"custom_fields,omitempty"`
 	Raw            string              `json:"raw,omitempty"`
+	// SessionRetries counts how many times this request was re-queued after a
+	// session refresh, bounding requeues when sessions keep expiring.
+	SessionRetries int `json:"-"`
 }
 
 // RequestURL returns the request URL for the navigation
