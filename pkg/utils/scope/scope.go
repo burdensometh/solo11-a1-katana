@@ -10,6 +10,26 @@ import (
 	"golang.org/x/net/publicsuffix"
 )
 
+// Reason explains why a URL was rejected (or allowed) by scope validation.
+// The string values are stable identifiers written out with crawl results and
+// emitted in per-target scope statistics, so they must not be renamed without
+// updating consumers.
+type Reason string
+
+const (
+	// ReasonAllowed is returned for URLs that pass every scope check.
+	ReasonAllowed Reason = ""
+	// ReasonOutOfBound is returned when a URL fails DNS/host scope or the
+	// configured in-scope/out-of-scope URL patterns.
+	ReasonOutOfBound Reason = "scope_out_of_bound"
+	// ReasonPathFiltered is returned when a URL is rejected by the extension /
+	// path filter (checked at the crawler layer rather than in Manager).
+	ReasonPathFiltered Reason = "scope_path_filtered"
+	// ReasonDepthExceeded is returned when a URL is discovered beyond the
+	// configured maximum crawl depth.
+	ReasonDepthExceeded Reason = "scope_depth_exceeded"
+)
+
 // Manager manages scope for crawling process
 type Manager struct {
 	inScope           []*regexp.Regexp
@@ -69,24 +89,40 @@ func NewManager(inScope, outOfScope []string, fieldScope string, noScope bool) (
 
 // Validate returns true if the URL matches scope rules.
 // When noScope is true, DNS validation is skipped but URL-based scope rules still apply.
+// It is a convenience wrapper around ValidateWithReason for callers that do not
+// need the rejection reason.
 func (m *Manager) Validate(URL *url.URL, rootHostname string) (bool, error) {
+	validated, _, err := m.ValidateWithReason(URL, rootHostname)
+	return validated, err
+}
+
+// ValidateWithReason behaves like Validate but additionally returns the Reason
+// explaining the decision: ReasonAllowed when the URL passes every check, or
+// ReasonOutOfBound when host (DNS) or URL-pattern scope rejects it.
+func (m *Manager) ValidateWithReason(URL *url.URL, rootHostname string) (bool, Reason, error) {
 	if !m.noScope {
 		// Only validate DNS if scope is enabled
 		hostname := URL.Hostname()
 		dnsValidated, err := m.validateDNS(hostname, rootHostname)
-		if err != nil || !dnsValidated {
-			return false, err
+		if err != nil {
+			return false, ReasonOutOfBound, err
+		}
+		if !dnsValidated {
+			return false, ReasonOutOfBound, nil
 		}
 	}
 
 	if len(m.inScope) > 0 || len(m.outOfScope) > 0 {
 		urlValidated, err := m.validateURL(URL.String())
-		if err != nil || !urlValidated {
-			return false, err
+		if err != nil {
+			return false, ReasonOutOfBound, err
+		}
+		if !urlValidated {
+			return false, ReasonOutOfBound, nil
 		}
 	}
 
-	return true, nil
+	return true, ReasonAllowed, nil
 }
 
 // validateURL checks whether the given URL matches the configured inScope and outOfScope patterns.

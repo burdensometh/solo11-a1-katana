@@ -23,6 +23,7 @@ import (
 	"github.com/projectdiscovery/katana/pkg/types"
 	"github.com/projectdiscovery/katana/pkg/utils"
 	"github.com/projectdiscovery/katana/pkg/utils/queue"
+	"github.com/projectdiscovery/katana/pkg/utils/scope"
 	"github.com/projectdiscovery/retryablehttp-go"
 	"github.com/projectdiscovery/utils/errkit"
 	httputil "github.com/projectdiscovery/utils/http"
@@ -46,13 +47,19 @@ type hostBackoff struct {
 const hostBackoffsCacheSize = 10000
 
 type Shared struct {
-	Headers            map[string]string
-	KnownFiles         *files.KnownFiles
-	Options            *types.CrawlerOptions
-	Jar                *httputil.CookieJar
-	PathTrie           *utils.PathTrie
+	Headers           map[string]string
+	KnownFiles        *files.KnownFiles
+	Options           *types.CrawlerOptions
+	Jar               *httputil.CookieJar
+	PathTrie          *utils.PathTrie
 	DomainPageCounter sync.Map
-	hostBackoffs *lru.Cache[string, *hostBackoff]
+	ScopeStats        *ScopeStats
+	hostBackoffs      *lru.Cache[string, *hostBackoff]
+
+	// Scope-stats ticker lifecycle, guarded by statsStopMu in stats.go.
+	statsActive  bool
+	statsWaiters int
+	statsStop    func()
 }
 
 // NewShared creates a new Shared instance with the provided crawler options.
@@ -67,6 +74,7 @@ func NewShared(options *types.CrawlerOptions) (*Shared, error) {
 		Headers:      options.Options.ParseCustomHeaders(),
 		Options:      options,
 		hostBackoffs: backoffCache,
+		ScopeStats:   NewScopeStats(),
 	}
 	if options.Options.KnownFiles != "" {
 		httpclient, _, err := BuildHttpClient(options.Dialer, options.Options, nil)
@@ -129,7 +137,8 @@ func (s *Shared) Enqueue(queue *queue.Queue, navigationRequests ...*navigation.R
 		// them for visiting. Uniqueness is intentionally not consumed here so that
 		// URLs can still be visited if later discovered at a valid depth via another path.
 		if nr.Depth > s.Options.Options.MaxDepth {
-			s.Output(nr, nil, ErrMaxDepthReached)
+			s.ScopeStats.RecordBlocked(nr.RootHostname, scope.ReasonDepthExceeded)
+			s.OutputWithReason(nr, nil, ErrMaxDepthReached, scope.ReasonDepthExceeded)
 			continue
 		}
 
@@ -152,16 +161,18 @@ func (s *Shared) Enqueue(queue *queue.Queue, navigationRequests ...*navigation.R
 		}
 
 		// skip crawling if the endpoint is not in scope
-		inScope := s.ValidateScope(nr.URL, nr.RootHostname)
+		inScope, reason := s.ValidateScope(nr.URL, nr.RootHostname)
 		if !inScope {
+			s.ScopeStats.RecordBlocked(s.scopeTarget(nr), reason)
 			// if the user requested anyway out of scope items
 			// they are sent to output without visiting
 			if s.Options.Options.DisplayOutScope {
-				s.Output(nr, nil, ErrOutOfScope)
+				s.OutputWithReason(nr, nil, ErrOutOfScope, reason)
 			}
 			continue
 		}
 
+		s.ScopeStats.RecordAllowed(s.scopeTarget(nr))
 		queue.Push(nr, s.priority(nr))
 
 		if s.Options.Options.PathClimb {
@@ -178,7 +189,7 @@ func (s *Shared) Enqueue(queue *queue.Queue, navigationRequests ...*navigation.R
 				if !s.Options.UniqueFilter.UniqueURL(checkURL) {
 					continue
 				}
-				if !s.ValidateScope(extractedParentURL, nr.RootHostname) {
+				if inScope, _ := s.ValidateScope(extractedParentURL, nr.RootHostname); !inScope {
 					continue
 				}
 
@@ -202,16 +213,34 @@ func (s *Shared) Enqueue(queue *queue.Queue, navigationRequests ...*navigation.R
 }
 
 // ValidateScope checks whether a given URL is within the allowed crawling scope
-// based on the configured scope rules and the root hostname.
-// Returns true if the URL passes scope validation, false otherwise.
-func (s *Shared) ValidateScope(URL string, root string) bool {
+// based on the configured scope rules and the root hostname. It returns true
+// (with scope.ReasonAllowed) when the URL passes scope validation, otherwise
+// false with the scope.Reason code explaining the rejection.
+func (s *Shared) ValidateScope(URL string, root string) (bool, scope.Reason) {
 	parsed, err := urlutil.Parse(URL)
 	if err != nil {
 		gologger.Warning().Msgf("failed to parse url while validating scope: %v", err)
-		return false
+		return false, scope.ReasonOutOfBound
 	}
-	scopeValidated, err := s.Options.ScopeManager.Validate(parsed.URL, root)
-	return err == nil && scopeValidated
+	scopeValidated, reason, err := s.Options.ScopeManager.ValidateWithReason(parsed.URL, root)
+	if err != nil {
+		gologger.Warning().Msgf("failed to validate scope for %q: %v", URL, err)
+		return false, scope.ReasonOutOfBound
+	}
+	return scopeValidated, reason
+}
+
+// scopeTarget returns the root hostname a navigation request belongs to. Some
+// early requests (e.g. the seed itself) do not carry RootHostname, so the URL
+// host is used as a fallback to keep statistics attributed to a real target.
+func (s *Shared) scopeTarget(nr *navigation.Request) string {
+	if nr.RootHostname != "" {
+		return nr.RootHostname
+	}
+	if parsed, err := urlutil.Parse(nr.URL); err == nil {
+		return parsed.Hostname()
+	}
+	return ""
 }
 
 // Output writes a crawl result to the configured output writer.
@@ -219,16 +248,24 @@ func (s *Shared) ValidateScope(URL string, root string) bool {
 // and error information (if any), then writes it to the output writer.
 // If an OnResult callback is configured and output writing succeeds, the callback is invoked.
 func (s *Shared) Output(navigationRequest *navigation.Request, navigationResponse *navigation.Response, err error) {
+	s.OutputWithReason(navigationRequest, navigationResponse, err, scope.ReasonAllowed)
+}
+
+// OutputWithReason is Output with an explicit scope.Reason code. The reason is
+// carried on the written Result so consumers can tell which rule intercepted
+// the request; it is empty for normally visited URLs.
+func (s *Shared) OutputWithReason(navigationRequest *navigation.Request, navigationResponse *navigation.Response, err error, reason scope.Reason) {
 	var errData string
 	if err != nil {
 		errData = err.Error()
 	}
 	// Write the found result to output
 	result := &output.Result{
-		Timestamp: time.Now(),
-		Request:   navigationRequest,
-		Response:  navigationResponse,
-		Error:     errData,
+		Timestamp:  time.Now(),
+		Request:    navigationRequest,
+		Response:   navigationResponse,
+		Error:      errData,
+		SkipReason: string(reason),
 	}
 
 	outputErr := s.Options.OutputWriter.Write(result)
@@ -405,11 +442,15 @@ func (s *Shared) NewCrawlSessionWithURL(URL string) (*CrawlSession, error) {
 type DoRequestFunc func(crawlSession *CrawlSession, req *navigation.Request) (*navigation.Response, error)
 
 // AcceptRequest returns the request in a popped queue item when it is a URL
-// that passes the path and scope filters.
-func (s *Shared) AcceptRequest(crawlSession *CrawlSession, item interface{}) (req *navigation.Request, inScope, ok bool) {
+// that passes the path and scope filters. When ok is false the request is
+// skipped and reason carries the scope.Reason code of the rule that rejected
+// it (scope_path_filtered or scope_out_of_bound); reason is empty for items
+// that are skipped before any scope decision (wrong queue item type, malformed
+// URL). Every rejection is recorded on the per-target ScopeStats collector.
+func (s *Shared) AcceptRequest(crawlSession *CrawlSession, item interface{}) (req *navigation.Request, inScope bool, reason scope.Reason, ok bool) {
 	req, ok = item.(*navigation.Request)
 	if !ok {
-		return nil, false, false
+		return nil, false, scope.ReasonAllowed, false
 	}
 
 	if !utils.IsURL(req.URL) {
@@ -417,24 +458,27 @@ func (s *Shared) AcceptRequest(crawlSession *CrawlSession, item interface{}) (re
 			s.Options.Options.OnSkipURL(req.URL)
 		}
 		gologger.Debug().Msgf("`%v` not a url. skipping", req.URL)
-		return nil, false, false
+		return nil, false, scope.ReasonAllowed, false
 	}
 
 	if !s.Options.ValidatePath(req.URL) {
 		gologger.Debug().Msgf("`%v` filtered path. skipping", req.URL)
-		return nil, false, false
+		s.ScopeStats.RecordBlocked(crawlSession.Hostname, scope.ReasonPathFiltered)
+		return nil, false, scope.ReasonPathFiltered, false
 	}
 
-	inScope, scopeErr := s.Options.ValidateScope(req.URL, crawlSession.Hostname)
+	inScope, reason, scopeErr := s.Options.ValidateScopeWithReason(req.URL, crawlSession.Hostname)
 	if scopeErr != nil {
 		gologger.Debug().Msgf("Error validating scope for `%v`: %v. skipping", req.URL, scopeErr)
-		return nil, false, false
+		s.ScopeStats.RecordBlocked(crawlSession.Hostname, scope.ReasonOutOfBound)
+		return nil, false, scope.ReasonOutOfBound, false
 	}
 	if !req.SkipValidation && !inScope {
 		gologger.Debug().Msgf("`%v` not in scope. skipping", req.URL)
-		return nil, false, false
+		s.ScopeStats.RecordBlocked(crawlSession.Hostname, reason)
+		return nil, false, reason, false
 	}
-	return req, inScope, true
+	return req, inScope, scope.ReasonAllowed, true
 }
 
 // Do executes the main crawling loop for the given crawl session.
@@ -452,7 +496,7 @@ func (s *Shared) Do(crawlSession *CrawlSession, doRequest DoRequestFunc) error {
 			break
 		}
 
-		req, inScope, ok := s.AcceptRequest(crawlSession, item)
+		req, inScope, _, ok := s.AcceptRequest(crawlSession, item)
 		if !ok {
 			crawlSession.Queue.Done()
 			continue

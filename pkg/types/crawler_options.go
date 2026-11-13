@@ -311,14 +311,22 @@ func (c *CrawlerOptions) BuildKnowledgeBase(body string, req *http.Request, resp
 
 // ValidateScope validates scope for an AbsURL
 func (c *CrawlerOptions) ValidateScope(absURL, rootHostname string) (bool, error) {
+	validated, _, err := c.ValidateScopeWithReason(absURL, rootHostname)
+	return validated, err
+}
+
+// ValidateScopeWithReason behaves like ValidateScope but also returns the
+// scope.Reason explaining the decision. Parse/validation errors are reported as
+// ReasonOutOfBound.
+func (c *CrawlerOptions) ValidateScopeWithReason(absURL, rootHostname string) (bool, scope.Reason, error) {
 	parsed, err := urlutil.Parse(absURL)
 	if err != nil {
-		return false, err
+		return false, scope.ReasonOutOfBound, err
 	}
 	if c.ScopeManager != nil {
-		return c.ScopeManager.Validate(parsed.URL, rootHostname)
+		return c.ScopeManager.ValidateWithReason(parsed.URL, rootHostname)
 	}
-	return true, nil
+	return true, scope.ReasonAllowed, nil
 }
 
 func newDecider(options *Options) (*decider.Cache, error) {

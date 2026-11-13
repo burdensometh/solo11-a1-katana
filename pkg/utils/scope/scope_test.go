@@ -109,6 +109,82 @@ func TestManagerValidate(t *testing.T) {
 	})
 }
 
+// TestValidateWithReason verifies that ValidateWithReason returns the
+// expected Reason alongside the boolean decision for each rejection rule.
+func TestValidateWithReason(t *testing.T) {
+	t.Run("allowed returns empty reason", func(t *testing.T) {
+		manager, err := NewManager(nil, nil, "fqdn", false)
+		require.NoError(t, err)
+
+		parsed, _ := urlutil.Parse("https://example.com/index")
+		validated, reason, err := manager.ValidateWithReason(parsed.URL, "example.com")
+		require.NoError(t, err)
+		require.True(t, validated)
+		require.Equal(t, ReasonAllowed, reason)
+	})
+
+	t.Run("DNS scope failure returns out-of-bound reason", func(t *testing.T) {
+		manager, err := NewManager(nil, nil, "fqdn", false)
+		require.NoError(t, err)
+
+		parsed, _ := urlutil.Parse("https://evil.example.org/index")
+		validated, reason, err := manager.ValidateWithReason(parsed.URL, "example.com")
+		require.NoError(t, err)
+		require.False(t, validated)
+		require.Equal(t, ReasonOutOfBound, reason)
+	})
+
+	t.Run("outOfScope URL pattern returns out-of-bound reason", func(t *testing.T) {
+		manager, err := NewManager(nil, []string{`logout\.php`}, "fqdn", false)
+		require.NoError(t, err)
+
+		parsed, _ := urlutil.Parse("https://example.com/logout.php")
+		validated, reason, err := manager.ValidateWithReason(parsed.URL, "example.com")
+		require.NoError(t, err)
+		require.False(t, validated)
+		require.Equal(t, ReasonOutOfBound, reason)
+	})
+
+	t.Run("inScope URL pattern miss returns out-of-bound reason", func(t *testing.T) {
+		manager, err := NewManager([]string{`/api/`}, nil, "fqdn", false)
+		require.NoError(t, err)
+
+		parsed, _ := urlutil.Parse("https://example.com/about")
+		validated, reason, err := manager.ValidateWithReason(parsed.URL, "example.com")
+		require.NoError(t, err)
+		require.False(t, validated)
+		require.Equal(t, ReasonOutOfBound, reason)
+	})
+
+	t.Run("noScope still reports pattern rejections", func(t *testing.T) {
+		manager, err := NewManager(nil, []string{`/admin/`}, "fqdn", true)
+		require.NoError(t, err)
+
+		// Cross-host URL is allowed because DNS checks are skipped with noScope.
+		parsed, _ := urlutil.Parse("https://other.example.org/page")
+		validated, reason, err := manager.ValidateWithReason(parsed.URL, "example.com")
+		require.NoError(t, err)
+		require.True(t, validated)
+		require.Equal(t, ReasonAllowed, reason)
+
+		parsed, _ = urlutil.Parse("https://other.example.org/admin/panel")
+		validated, reason, err = manager.ValidateWithReason(parsed.URL, "example.com")
+		require.NoError(t, err)
+		require.False(t, validated)
+		require.Equal(t, ReasonOutOfBound, reason)
+	})
+
+	t.Run("Validate stays backwards compatible", func(t *testing.T) {
+		manager, err := NewManager(nil, nil, "fqdn", false)
+		require.NoError(t, err)
+
+		parsed, _ := urlutil.Parse("https://example.com/index")
+		validated, err := manager.Validate(parsed.URL, "example.com")
+		require.NoError(t, err)
+		require.True(t, validated)
+	})
+}
+
 // TestGetDomainRDNandDN verifies the extraction of root domain name (RDN) and
 // effective top-level domain plus one label (eTLD+1) from a hostname.
 func TestGetDomainRDNandDN(t *testing.T) {

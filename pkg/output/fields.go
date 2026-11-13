@@ -30,6 +30,7 @@ var FieldNames = []string{
 	"kv",
 	"dir",
 	"udir",
+	"reason",
 }
 
 type fieldOutput struct {
@@ -188,6 +189,10 @@ func formatField(output *Result, fields string) []fieldOutput {
 					svalue = append(svalue, fieldOutput{field: "dir", value: directory})
 				}
 			}
+		case "reason":
+			if output.SkipReason != "" {
+				svalue = append(svalue, fieldOutput{field: "reason", value: output.SkipReason})
+			}
 		default:
 			if v, ok := output.Request.CustomFields[f]; ok {
 				for _, r := range v {
@@ -258,6 +263,8 @@ func getValueForField(output *Result, parsed *url.URL, hostname, rdn, rurl, fiel
 			}
 		}
 		return strings.Join(values, "\n")
+	case "reason":
+		return output.SkipReason
 	}
 	return ""
 }

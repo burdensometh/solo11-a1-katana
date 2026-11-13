@@ -43,3 +43,20 @@ func TestFormatField(t *testing.T) {
 		require.ElementsMatch(t, test.result, result, "could not equal value")
 	}
 }
+
+func TestFormatFieldReason(t *testing.T) {
+	result := &Result{
+		Request:    &navigation.Request{URL: "https://example.com/blocked"},
+		SkipReason: "scope_out_of_bound",
+	}
+
+	formatted := formatField(result, "reason")
+	require.Equal(t, []fieldOutput{{"reason", "scope_out_of_bound"}}, formatted)
+
+	// A normal result without a skip reason produces no reason field.
+	plain := formatField(&Result{Request: &navigation.Request{URL: "https://example.com/ok"}}, "reason")
+	require.Empty(t, plain)
+
+	// The reason field is part of the validated field names.
+	require.NoError(t, validateFieldNames("reason"))
+}

@@ -74,7 +74,8 @@ func newTestShared(maxDepth int, opts ...func(*types.Options)) (*Shared, *mockWr
 	}
 
 	shared := &Shared{
-		Options: crawlerOpts,
+		Options:    crawlerOpts,
+		ScopeStats: NewScopeStats(),
 	}
 	return shared, writer
 }
@@ -137,6 +138,9 @@ func TestEnqueueMaxDepthOutputsDiscoveredURLs(t *testing.T) {
 		)
 
 		require.Equal(t, 3, len(writer.results), "all URLs beyond max depth should be output")
+		for _, result := range writer.results {
+			require.Equal(t, string(scope.ReasonDepthExceeded), result.SkipReason)
+		}
 	})
 
 	t.Run("discovered URLs do not consume uniqueness filter", func(t *testing.T) {
@@ -220,5 +224,125 @@ func TestEnqueueDomainPageBudget(t *testing.T) {
 		}
 
 		require.Equal(t, 100, q.Len())
+	})
+}
+
+func TestEnqueueScopeReasonAndStats(t *testing.T) {
+	t.Run("out-of-scope URL is counted and carries the reason when displayed", func(t *testing.T) {
+		shared, writer := newTestShared(3, func(o *types.Options) {
+			o.DisplayOutScope = true
+		})
+		// fqdn scope: only the exact root host is in scope.
+		shared.Options.ScopeManager, _ = scope.NewManager(nil, nil, "fqdn", false)
+		q, _ := queue.New("depth-first")
+
+		shared.Enqueue(q, &navigation.Request{
+			Method: http.MethodGet,
+			URL:    "https://evil.example.org/page",
+			Depth:  1,
+			RootHostname: "example.com",
+		})
+
+		require.Equal(t, 0, q.Len(), "out-of-scope URL must not enter the queue")
+		require.Equal(t, 1, len(writer.results), "DisplayOutScope should write the rejected URL")
+		require.Equal(t, string(scope.ReasonOutOfBound), writer.results[0].SkipReason)
+		require.Equal(t, ErrOutOfScope.Error(), writer.results[0].Error)
+
+		snaps := shared.ScopeStats.Snapshot()
+		require.Len(t, snaps, 1)
+		require.Equal(t, "example.com", snaps[0].target)
+		require.Equal(t, int64(0), snaps[0].allowed)
+		require.Equal(t, int64(1), snaps[0].blocked[scope.ReasonOutOfBound])
+	})
+
+	t.Run("in-scope URL is counted as allowed and enqueued", func(t *testing.T) {
+		shared, writer := newTestShared(3)
+		shared.Options.ScopeManager, _ = scope.NewManager(nil, nil, "fqdn", false)
+		q, _ := queue.New("depth-first")
+
+		shared.Enqueue(q, &navigation.Request{
+			Method: http.MethodGet,
+			URL:    "https://example.com/page",
+			Depth:  1,
+			RootHostname: "example.com",
+		})
+
+		require.Equal(t, 1, q.Len())
+		require.Equal(t, 0, len(writer.results))
+		snaps := shared.ScopeStats.Snapshot()
+		require.Len(t, snaps, 1)
+		require.Equal(t, int64(1), snaps[0].allowed)
+	})
+
+	t.Run("depth rejection increments the depth counter", func(t *testing.T) {
+		shared, _ := newTestShared(1)
+		q, _ := queue.New("depth-first")
+
+		shared.Enqueue(q, &navigation.Request{
+			Method: http.MethodGet,
+			URL:    "https://example.com/deep",
+			Depth:  5,
+			RootHostname: "example.com",
+		})
+
+		snaps := shared.ScopeStats.Snapshot()
+		require.Len(t, snaps, 1)
+		require.Equal(t, int64(1), snaps[0].blocked[scope.ReasonDepthExceeded])
+		require.Equal(t, int64(0), snaps[0].blocked[scope.ReasonOutOfBound])
+	})
+}
+
+func TestAcceptRequestReasons(t *testing.T) {
+	buildSession := func(shared *Shared) *CrawlSession {
+		return &CrawlSession{Hostname: "example.com"}
+	}
+
+	t.Run("path-filtered request returns the path reason", func(t *testing.T) {
+		shared, _ := newTestShared(3)
+		// Default extension denylist rejects .png.
+		shared.Options.ExtensionsValidator = extensions.NewValidator(nil, nil, false)
+		session := buildSession(shared)
+
+		req, inScope, reason, ok := shared.AcceptRequest(session, &navigation.Request{
+			Method: http.MethodGet,
+			URL:    "https://example.com/logo.png",
+		})
+		require.False(t, ok)
+		require.False(t, inScope)
+		require.Nil(t, req)
+		require.Equal(t, scope.ReasonPathFiltered, reason)
+
+		snaps := shared.ScopeStats.Snapshot()
+		require.Len(t, snaps, 1)
+		require.Equal(t, int64(1), snaps[0].blocked[scope.ReasonPathFiltered])
+	})
+
+	t.Run("out-of-scope request returns the out-of-bound reason", func(t *testing.T) {
+		shared, _ := newTestShared(3)
+		shared.Options.ScopeManager, _ = scope.NewManager(nil, nil, "fqdn", false)
+		session := buildSession(shared)
+
+		req, inScope, reason, ok := shared.AcceptRequest(session, &navigation.Request{
+			Method: http.MethodGet,
+			URL:    "https://evil.example.org/page",
+		})
+		require.False(t, ok)
+		require.False(t, inScope)
+		require.Nil(t, req)
+		require.Equal(t, scope.ReasonOutOfBound, reason)
+	})
+
+	t.Run("valid request passes with the allowed reason", func(t *testing.T) {
+		shared, _ := newTestShared(3)
+		session := buildSession(shared)
+
+		req, inScope, reason, ok := shared.AcceptRequest(session, &navigation.Request{
+			Method: http.MethodGet,
+			URL:    "https://example.com/page",
+		})
+		require.True(t, ok)
+		require.True(t, inScope)
+		require.NotNil(t, req)
+		require.Equal(t, scope.ReasonAllowed, reason)
 	})
 }

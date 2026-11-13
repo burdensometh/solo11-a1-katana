@@ -53,5 +53,12 @@ func (w *StandardWriter) formatScreen(output *Result) ([]byte, error) {
 		builder.WriteRune(']')
 	}
 
+	if w.verbose && output.SkipReason != "" {
+		builder.WriteRune(' ')
+		builder.WriteRune('[')
+		builder.WriteString(w.aurora.Red(output.SkipReason).String())
+		builder.WriteRune(']')
+	}
+
 	return builder.Bytes(), nil
 }

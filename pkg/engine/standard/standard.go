@@ -28,6 +28,8 @@ func (c *Crawler) Close() error {
 
 // Crawl crawls a URL with the specified options
 func (c *Crawler) Crawl(rootURL string) error {
+	c.StartScopeStats()
+	defer c.StopScopeStats()
 	crawlSession, err := c.NewCrawlSessionWithURL(rootURL)
 	if err != nil {
 		return errkit.Wrap(err, "standard")

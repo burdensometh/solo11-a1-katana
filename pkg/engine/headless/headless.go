@@ -11,6 +11,7 @@ import (
 
 	"github.com/lmittmann/tint"
 	"github.com/projectdiscovery/gologger"
+	"github.com/projectdiscovery/katana/pkg/engine/common"
 	"github.com/projectdiscovery/katana/pkg/engine/headless/auth"
 	"github.com/projectdiscovery/katana/pkg/engine/headless/browser"
 	"github.com/projectdiscovery/katana/pkg/engine/headless/captcha"
@@ -19,6 +20,7 @@ import (
 	"github.com/projectdiscovery/katana/pkg/output"
 	"github.com/projectdiscovery/katana/pkg/types"
 	"github.com/projectdiscovery/katana/pkg/utils"
+	"github.com/projectdiscovery/katana/pkg/utils/scope"
 )
 
 type Headless struct {
@@ -26,6 +28,12 @@ type Headless struct {
 	options *types.CrawlerOptions
 
 	pathTrie *utils.PathTrie
+
+	// ScopeStats collects per-target allowed/blocked counters for headless
+	// crawls; the headless crawler architecture does not go through
+	// common.Shared, so the collector is driven via the scope validator
+	// wrapper and the depth check in headless.Crawl.
+	scopeStats *common.ScopeStats
 
 	debugger *CrawlDebugger
 
@@ -42,6 +50,7 @@ func New(options *types.CrawlerOptions) (*Headless, error) {
 	headless := &Headless{
 		logger:         logger,
 		options:        options,
+		scopeStats:     common.NewScopeStats(),
 		activeCrawlers: make(map[*crawler.Crawler]struct{}),
 	}
 	if options.Options.FilterSimilar {
@@ -89,26 +98,65 @@ func newLogger(options *types.CrawlerOptions) *slog.Logger {
 	return logger
 }
 
-func validateScopeFunc(h *Headless, URL string) browser.ScopeValidator {
+// rootHostnameOf extracts the hostname from an absolute URL, falling back to
+// the raw input when it cannot be parsed.
+func rootHostnameOf(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	return parsed.Hostname()
+}
+
+// validateScopeFunc returns the browser scope validator used by the headless
+// crawler. Every decision is recorded on the per-target ScopeStats collector:
+// rejected URLs are counted under scope_out_of_bound, accepted URLs are
+// counted as allowed. The browser invokes the validator at several decision
+// points for the same URL, so decisions are de-duplicated per URL within one
+// target to keep counters meaningful.
+func (h *Headless) validateScopeFunc(URL string) browser.ScopeValidator {
 	parsedURL, err := url.Parse(URL)
 	if err != nil {
 		return func(string) bool { return true }
 	}
 	rootHostname := parsedURL.Hostname()
 
+	// seen records the first decision (allowed=true/false) observed for each
+	// URL within this target crawl so repeated validator calls do not inflate
+	// the counters.
+	var seen sync.Map // map[string]bool
+
+	record := func(rawURL string, allowed bool, reason scope.Reason) {
+		if _, loaded := seen.LoadOrStore(rawURL, allowed); loaded {
+			return
+		}
+		if allowed {
+			h.scopeStats.RecordAllowed(rootHostname)
+		} else {
+			h.scopeStats.RecordBlocked(rootHostname, reason)
+		}
+	}
+
 	return func(s string) bool {
 		if h.options.ScopeManager == nil {
+			record(s, true, scope.ReasonAllowed)
 			return true
 		}
 		parsed, err := url.Parse(s)
 		if err != nil {
+			record(s, false, scope.ReasonOutOfBound)
 			return false
 		}
-		validated, err := h.options.ScopeManager.Validate(parsed, rootHostname)
-		if err != nil {
+		validated, reason, err := h.options.ScopeManager.ValidateWithReason(parsed, rootHostname)
+		if err != nil || !validated {
+			if err != nil {
+				reason = scope.ReasonOutOfBound
+			}
+			record(s, false, reason)
 			return false
 		}
-		return validated
+		record(s, true, scope.ReasonAllowed)
+		return true
 	}
 }
 
@@ -123,7 +171,16 @@ func (h *Headless) Crawl(URL string) error {
 		}
 	}()
 
-	scopeValidator := validateScopeFunc(h, URL)
+	scopeValidator := h.validateScopeFunc(URL)
+	// The headless crawler handles depth and scope internally. Periodic scope
+	// summaries follow the same -stats switch as the progress stats; counters
+	// are always collected via the validator wrapper above.
+	if h.options.Options.ShowStatistics {
+		statsInterval := time.Duration(h.options.Options.StatsInterval) * time.Second
+		stopScopeStats := h.scopeStats.StartPeriodicReport(statsInterval)
+		defer stopScopeStats()
+	}
+	targetHostname := rootHostnameOf(URL)
 	crawlOpts := crawler.Options{
 		Context:               h.options.Options.Context,
 		UseInstalledChrome:    h.options.Options.UseInstalledChrome,
@@ -154,6 +211,9 @@ func (h *Headless) Crawl(URL string) error {
 		ChromeWSUrl:           h.options.Options.ChromeWSUrl,
 		DOMWaitTime:           h.options.Options.DOMWaitTime,
 		MaxScrollSteps:        h.options.Options.MaxScrollSteps,
+		OnDepthExceeded: func(int) {
+			h.scopeStats.RecordBlocked(targetHostname, scope.ReasonDepthExceeded)
+		},
 		RequestCallback: func(rr *output.Result) {
 			if rr == nil || rr.Request == nil {
 				return

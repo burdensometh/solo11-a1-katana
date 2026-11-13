@@ -72,9 +72,13 @@ type Options struct {
 	EnableDiagnostics bool
 	DiagnosticsDir    string
 
-	Proxy                 string
-	Logger                *slog.Logger
-	ScopeValidator        browser.ScopeValidator
+	Proxy          string
+	Logger         *slog.Logger
+	ScopeValidator browser.ScopeValidator
+	// OnDepthExceeded, when set, is invoked for every action skipped because
+	// its depth is greater than MaxDepth. It lets the embedding engine count
+	// depth-based rejections in its scope statistics.
+	OnDepthExceeded       func(depth int)
 	RequestCallback       func(*output.Result)
 	TrafficCallback       func(*output.Result)
 	CustomHeaders         map[string]string
@@ -315,6 +319,9 @@ func (c *Crawler) Crawl(URL string) error {
 			}
 
 			if c.options.MaxDepth > 0 && action.Depth > c.options.MaxDepth {
+				if c.options.OnDepthExceeded != nil {
+					c.options.OnDepthExceeded(action.Depth)
+				}
 				continue
 			}
 

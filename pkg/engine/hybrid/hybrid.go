@@ -220,6 +220,8 @@ func (c *Crawler) Close() error {
 
 // Crawl crawls a URL with the specified options
 func (c *Crawler) Crawl(rootURL string) error {
+	c.StartScopeStats()
+	defer c.StopScopeStats()
 	crawlSession, err := c.NewCrawlSessionWithURL(rootURL)
 	if err != nil {
 		return errkit.Wrap(err, "hybrid")
@@ -246,7 +248,7 @@ func (c *Crawler) Do(crawlSession *common.CrawlSession, doRequest common.DoReque
 			return ctxErr
 		}
 
-		if req, inScope, ok := c.AcceptRequest(crawlSession, item); ok {
+		if req, inScope, _, ok := c.AcceptRequest(crawlSession, item); ok {
 			c.visit(crawlSession, req, inScope, doRequest)
 		}
 		crawlSession.Queue.Done()
