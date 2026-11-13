@@ -14,8 +14,9 @@ func init() {
 		Strategy:     queue.DepthFirst.String(),
 		FieldScope:   "rdn",
 
-		Concurrency: 10,
-		Parallelism: 10,
-		RateLimit:   150,
+		Concurrency:       4,
+		GlobalConcurrency: 0, // derived from Concurrency * Parallelism
+		Parallelism:       10,
+		RateLimit:         150,
 	}
 }

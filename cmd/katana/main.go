@@ -240,7 +240,8 @@ func readFlags() (*goflags.FlagSet, error) {
 
 	// Rate-Limit group
 	flagSet.CreateGroup("ratelimit", "Rate-Limit",
-		flagSet.IntVarP(&options.Concurrency, "concurrency", "c", 10, "number of concurrent fetchers to use"),
+		flagSet.IntVarP(&options.Concurrency, "concurrency", "c", 4, "number of concurrent fetchers per target (auto-halved on timeouts)"),
+		flagSet.IntVarP(&options.GlobalConcurrency, "global-concurrency", "gc", 0, "maximum concurrent fetchers across all targets (default concurrency x parallelism)"),
 		flagSet.IntVarP(&options.Parallelism, "parallelism", "p", 10, "number of concurrent inputs to process"),
 		flagSet.IntVarP(&options.Delay, "delay", "rd", 0, "request delay between each request in seconds"),
 		flagSet.IntVarP(&options.RateLimit, "rate-limit", "rl", 150, "maximum requests to send per second"),

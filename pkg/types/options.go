@@ -71,8 +71,13 @@ type Options struct {
 	HostRateLimit int
 	// HostRateLimitMinute is the maximum number of requests to send per minute per host
 	HostRateLimitMinute int
-	// Concurrency is the number of concurrent crawling goroutines
+	// Concurrency is the number of concurrent fetchers per target. Each
+	// target gets its own adaptive bucket of this size; it is halved on
+	// consecutive timeouts and restored one slot per second afterwards.
 	Concurrency int
+	// GlobalConcurrency is the maximum number of concurrent fetchers across
+	// all targets. Zero derives it from Concurrency * Parallelism.
+	GlobalConcurrency int
 	// Parallelism is the number of urls processing goroutines
 	Parallelism int
 	// FormConfig is the path to the form configuration file

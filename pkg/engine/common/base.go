@@ -13,11 +13,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/PuerkitoBio/goquery"
 	"github.com/go-rod/rod"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/katana/pkg/engine/parser/files"
+	"github.com/projectdiscovery/katana/pkg/engine/targetlimit"
 	"github.com/projectdiscovery/katana/pkg/navigation"
 	"github.com/projectdiscovery/katana/pkg/output"
 	"github.com/projectdiscovery/katana/pkg/types"
@@ -28,7 +29,6 @@ import (
 	httputil "github.com/projectdiscovery/utils/http"
 	mapsutil "github.com/projectdiscovery/utils/maps"
 	urlutil "github.com/projectdiscovery/utils/url"
-	"github.com/remeh/sizedwaitgroup"
 )
 
 // Shared represents the shared state and configuration used across all crawl sessions.
@@ -46,13 +46,48 @@ type hostBackoff struct {
 const hostBackoffsCacheSize = 10000
 
 type Shared struct {
-	Headers            map[string]string
-	KnownFiles         *files.KnownFiles
-	Options            *types.CrawlerOptions
-	Jar                *httputil.CookieJar
-	PathTrie           *utils.PathTrie
+	Headers           map[string]string
+	KnownFiles        *files.KnownFiles
+	Options           *types.CrawlerOptions
+	Jar               *httputil.CookieJar
+	PathTrie          *utils.PathTrie
 	DomainPageCounter sync.Map
+	// limiter allocates request slots per target under a global ceiling. It is
+	// shared by every crawl session started from this Shared, so a slow target
+	// cannot occupy the slots of a healthy one. It is created on first use and
+	// published through limiterValue for Close.
+	limiterOnce  sync.Once
+	limiterValue atomic.Pointer[targetlimit.Limiter]
 	hostBackoffs *lru.Cache[string, *hostBackoff]
+}
+
+// requestLimiter returns the per-target concurrency limiter, creating it on
+// first use.
+func (s *Shared) requestLimiter() *targetlimit.Limiter {
+	s.limiterOnce.Do(func() {
+		s.limiterValue.Store(targetlimit.New(targetlimit.Options{
+			PerTarget:   s.Options.Options.Concurrency,
+			Parallelism: s.Options.Options.Parallelism,
+			Global:      s.Options.Options.GlobalConcurrency,
+		}))
+	})
+	return s.limiterValue.Load()
+}
+
+// RequestLimiter exposes the per-target concurrency limiter of this engine.
+func (s *Shared) RequestLimiter() *targetlimit.Limiter {
+	return s.requestLimiter()
+}
+
+// Close releases the per-target limiter's recovery goroutine. It is safe to
+// call more than once and to race with Do: the once completes any lazy
+// creation first, so the published pointer cannot be missed.
+func (s *Shared) Close() error {
+	s.limiterOnce.Do(func() {})
+	if l := s.limiterValue.Load(); l != nil {
+		l.Close()
+	}
+	return nil
 }
 
 // NewShared creates a new Shared instance with the provided crawler options.
@@ -306,6 +341,15 @@ type CrawlSession struct {
 	Browser    *rod.Browser
 }
 
+// TargetKey names the concurrency bucket of this session. One crawl session
+// is one target, so the root URL identifies the bucket.
+func (s *CrawlSession) TargetKey() string {
+	if s.URL != nil {
+		return s.URL.String()
+	}
+	return s.Hostname
+}
+
 // NewCrawlSessionWithURL creates and initializes a new crawl session for the specified URL.
 // It performs the following initialization steps:
 //  1. Creates a context with optional timeout based on CrawlDuration setting
@@ -438,18 +482,29 @@ func (s *Shared) AcceptRequest(crawlSession *CrawlSession, item interface{}) (re
 }
 
 // Do executes the main crawling loop for the given crawl session.
-// It processes items from the queue concurrently (respecting the Concurrency limit),
-// validates each request (URL format, path filters, scope), applies rate limiting
-// and delays, executes the request using the provided doRequest function, writes
-// results to output, and enqueues any newly discovered URLs from responses.
+// It processes items from the queue concurrently, validates each request (URL
+// format, path filters, scope), applies rate limiting and delays, executes the
+// request using the provided doRequest function, writes results to output, and
+// enqueues any newly discovered URLs from responses.
+//
+// Concurrency is allocated per target by s.Limiter rather than by a single
+// session-wide worker pool. One dispatcher reads the session queue, claims a
+// slot of the target's bucket for each request and only then spawns the
+// request goroutine, so a slow target can only starve itself while a global
+// ceiling bounds the total number of in-flight requests across every crawl.
+// Timeouts halve the target's budget and successes restore it one slot per
+// second, so a consistently slow target backs off automatically while healthy
+// targets keep their full share.
 //
 // The method returns when the queue is empty or the session context is cancelled
 // (due to timeout or manual cancellation). Returns an error if the context is cancelled.
 func (s *Shared) Do(crawlSession *CrawlSession, doRequest DoRequestFunc) error {
-	wg := sizedwaitgroup.New(s.Options.Options.Concurrency)
+	var wg sync.WaitGroup
+
 	for item := range crawlSession.Queue.PopWithContext(crawlSession.Ctx) {
 		if crawlSession.Ctx.Err() != nil {
-			break
+			crawlSession.Queue.Done()
+			continue
 		}
 
 		req, inScope, ok := s.AcceptRequest(crawlSession, item)
@@ -458,90 +513,124 @@ func (s *Shared) Do(crawlSession *CrawlSession, doRequest DoRequestFunc) error {
 			continue
 		}
 
-		wg.Add()
+		// Claim the target slot before spawning: the goroutine count is thus
+		// bounded by the sum of the per-target budgets (and the global
+		// ceiling), instead of growing with the number of queued URLs.
+		//
+		// An error means the session ended (its context is done) or the engine
+		// was closed; either way the item is dropped and the queue is drained.
+		release, err := s.RequestLimiter().Acquire(crawlSession.Ctx, crawlSession.TargetKey())
+		if err != nil {
+			crawlSession.Queue.Done()
+			continue
+		}
+
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer release()
 			defer crawlSession.Queue.Done()
-
-			// Race Take() against the session context so that workers
-			// don't block shutdown waiting for the next limiter tick
-			// (the limiter is bound to options.Context, not the session).
-			//
-			// Note: when the session is cancelled mid-Take, this inner
-			// goroutine outlives the worker and stays blocked on the
-			// limiter until the next tick or until RateLimit.Stop() is
-			// called by CrawlerOptions.Close(). The leak is therefore
-			// bounded by Close() and acceptable.
-			takeDone := make(chan struct{})
-			go func() {
-				if s.Options.HostRateLimit != nil {
-					_ = s.Options.HostRateLimit.Take(crawlSession.Hostname)
-				} else if s.Options.RateLimit != nil {
-					s.Options.RateLimit.Take()
-				}
-				close(takeDone)
-			}()
-			select {
-			case <-crawlSession.Ctx.Done():
-				return
-			case <-takeDone:
-			}
-			s.ApplyBackoff(crawlSession.Hostname)
-
-			if crawlSession.Ctx.Err() != nil {
-				return
-			}
-
-			// Context-aware delay
-			if s.Options.Options.Delay > 0 {
-				select {
-				case <-crawlSession.Ctx.Done():
-					return
-				case <-time.After(time.Duration(s.Options.Options.Delay) * time.Second):
-				}
-			}
-
-			if s.Options.Options.MaxDomainPages > 0 {
-				counter := s.DomainCounter(crawlSession.Hostname)
-				if counter.Add(1) > int64(s.Options.Options.MaxDomainPages) {
-					return
-				}
-			}
-
-			resp, err := doRequest(crawlSession, req)
-
-			if resp != nil && IsThrottled(resp.StatusCode) {
-				s.RecordThrottle(crawlSession.Hostname, resp.StatusCode)
-			} else if resp != nil {
-				s.RecordSuccess(crawlSession.Hostname)
-			}
-
-			if inScope {
-				s.Output(req, resp, err)
-			}
-
-			if err != nil {
-				gologger.Warning().Msgf("Could not request seed URL %s: %s\n", req.URL, err)
-				outputError := &output.Error{
-					Timestamp: time.Now(),
-					Endpoint:  req.RequestURL(),
-					Source:    req.Source,
-					Error:     err.Error(),
-				}
-				_ = s.Options.OutputWriter.WriteErr(outputError)
-				return
-			}
-			if resp == nil || resp.Resp == nil || resp.Reader == nil {
-				return
-			}
-			if s.Options.Options.DisableRedirects && resp.IsRedirect() {
-				return
-			}
-
-			navigationRequests := s.Options.Parser.ParseResponse(resp)
-			s.Enqueue(crawlSession.Queue, navigationRequests...)
+			s.processRequest(crawlSession, req, inScope, doRequest)
 		}()
 	}
 	wg.Wait()
 	return crawlSession.Ctx.Err()
+}
+
+// processRequest executes one queued request. The caller already holds the
+// request's concurrency slot.
+func (s *Shared) processRequest(crawlSession *CrawlSession, req *navigation.Request, inScope bool, doRequest DoRequestFunc) {
+	target := crawlSession.TargetKey()
+	limiter := s.RequestLimiter()
+
+	// Race Take() against the session context so that workers
+	// don't block shutdown waiting for the next limiter tick
+	// (the limiter is bound to options.Context, not the session).
+	//
+	// Note: when the session is cancelled mid-Take, this inner
+	// goroutine outlives the worker and stays blocked on the
+	// limiter until the next tick or until RateLimit.Stop() is
+	// called by CrawlerOptions.Close(). The leak is therefore
+	// bounded by Close() and acceptable.
+	takeDone := make(chan struct{})
+	go func() {
+		if s.Options.HostRateLimit != nil {
+			_ = s.Options.HostRateLimit.Take(crawlSession.Hostname)
+		} else if s.Options.RateLimit != nil {
+			s.Options.RateLimit.Take()
+		}
+		close(takeDone)
+	}()
+	select {
+	case <-crawlSession.Ctx.Done():
+		return
+	case <-takeDone:
+	}
+	s.ApplyBackoff(crawlSession.Hostname)
+
+	if crawlSession.Ctx.Err() != nil {
+		return
+	}
+
+	// Context-aware delay
+	if s.Options.Options.Delay > 0 {
+		select {
+		case <-crawlSession.Ctx.Done():
+			return
+		case <-time.After(time.Duration(s.Options.Options.Delay) * time.Second):
+		}
+	}
+
+	if s.Options.Options.MaxDomainPages > 0 {
+		counter := s.DomainCounter(crawlSession.Hostname)
+		if counter.Add(1) > int64(s.Options.Options.MaxDomainPages) {
+			return
+		}
+	}
+
+	resp, err := doRequest(crawlSession, req)
+
+	// A timeout is a target-health signal: it halves the target's concurrency
+	// budget. A completed, non-throttled request ends the timeout streak and
+	// starts recovery; a 429/503 neither halves nor restores the budget,
+	// since the per-host backoff already handles it. A cancelled session
+	// context is the crawl ending, not a slow target.
+	switch {
+	case err != nil && crawlSession.Ctx.Err() == nil && targetlimit.IsTimeoutError(err):
+		limiter.RecordTimeout(target)
+		gologger.Debug().Msgf("Target %s timed out, concurrency lowered to %d", target, limiter.Limit(target))
+	case resp != nil && !IsThrottled(resp.StatusCode):
+		limiter.RecordSuccess(target)
+	}
+
+	if resp != nil && IsThrottled(resp.StatusCode) {
+		s.RecordThrottle(crawlSession.Hostname, resp.StatusCode)
+	} else if resp != nil {
+		s.RecordSuccess(crawlSession.Hostname)
+	}
+
+	if inScope {
+		s.Output(req, resp, err)
+	}
+
+	if err != nil {
+		gologger.Warning().Msgf("Could not request seed URL %s: %s\n", req.URL, err)
+		outputError := &output.Error{
+			Timestamp: time.Now(),
+			Endpoint:  req.RequestURL(),
+			Source:    req.Source,
+			Error:     err.Error(),
+		}
+		_ = s.Options.OutputWriter.WriteErr(outputError)
+		return
+	}
+	if resp == nil || resp.Resp == nil || resp.Reader == nil {
+		return
+	}
+	if s.Options.Options.DisableRedirects && resp.IsRedirect() {
+		return
+	}
+
+	navigationRequests := s.Options.Parser.ParseResponse(resp)
+	s.Enqueue(crawlSession.Queue, navigationRequests...)
 }

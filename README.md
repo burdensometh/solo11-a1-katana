@@ -215,8 +215,9 @@ FILTER:
    -filter-page-type string[]      filter response with page type (e.g. error,captcha,parked)
 
 RATE-LIMIT:
-   -c, -concurrency int          number of concurrent fetchers to use (default 10)
-   -p, -parallelism int          number of concurrent inputs to process (default 10)
+   -c, -concurrency int                number of concurrent fetchers per target (auto-halved on timeouts) (default 4)
+   -gc, -global-concurrency int        maximum concurrent fetchers across all targets (default concurrency x parallelism)
+   -p, -parallelism int                number of concurrent inputs to process (default 10)
    -rd, -delay int               request delay between each request in seconds
    -rl, -rate-limit int          maximum requests to send per second (default 150)
    -rlm, -rate-limit-minute int  maximum number of requests to send per minute
@@ -1132,12 +1133,19 @@ katana -u https://tesla.com -delay 20
 
 *`-concurrency`*
 -----
-option to control the number of urls per target to fetch at the same time.
+option to control the number of urls per target to fetch at the same time. Each target gets its own bucket, so a slow target can only slow itself down instead of occupying the slots of the other targets. The default is 4. A target's bucket is halved on every consecutive request timeout (never below 1), and after the next successful request one slot is added back every second until the original value is restored.
 
 ```
 katana -u https://tesla.com -c 20
 ```
 
+*`-global-concurrency`*
+-----
+option to cap the total number of concurrent fetchers across every target, so crawling a long list of targets cannot oversubscribe the machine. Defaults to `-concurrency` multiplied by `-parallelism` (`-c 4 -p 10` gives 40). It must not be smaller than `-concurrency`.
+
+```
+katana -u https://tesla.com -c 4 -gc 32
+```
 
 *`-parallelism`*
 -----
@@ -1186,8 +1194,9 @@ katana -h rate-limit
 
 Flags:
 RATE-LIMIT:
-   -c, -concurrency int          number of concurrent fetchers to use (default 10)
-   -p, -parallelism int          number of concurrent inputs to process (default 10)
+   -c, -concurrency int                number of concurrent fetchers per target (auto-halved on timeouts) (default 4)
+   -gc, -global-concurrency int        maximum concurrent fetchers across all targets (default concurrency x parallelism)
+   -p, -parallelism int                number of concurrent inputs to process (default 10)
    -rd, -delay int               request delay between each request in seconds
    -rl, -rate-limit int          maximum requests to send per second (default 150)
    -rlm, -rate-limit-minute int  maximum number of requests to send per minute

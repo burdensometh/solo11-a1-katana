@@ -23,7 +23,7 @@ func New(options *types.CrawlerOptions) (*Crawler, error) {
 
 // Close closes the crawler process
 func (c *Crawler) Close() error {
-	return nil
+	return c.Shared.Close()
 }
 
 // Crawl crawls a URL with the specified options

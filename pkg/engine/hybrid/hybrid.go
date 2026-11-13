@@ -13,6 +13,7 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/katana/pkg/engine/common"
+	"github.com/projectdiscovery/katana/pkg/engine/targetlimit"
 	"github.com/projectdiscovery/katana/pkg/navigation"
 	"github.com/projectdiscovery/katana/pkg/output"
 	"github.com/projectdiscovery/katana/pkg/types"
@@ -211,10 +212,16 @@ func (c *Crawler) Close() error {
 	}
 	if c.Options.Options.ChromeDataDir == "" {
 		if err := os.RemoveAll(c.tempDir); err != nil {
+			if c.Shared != nil {
+				_ = c.Shared.Close()
+			}
 			return err
 		}
 	}
 	// processutil.CloseProcesses(processutil.IsChromeProcess, c.previousPIDs)
+	if c.Shared != nil {
+		return c.Shared.Close()
+	}
 	return nil
 }
 
@@ -256,6 +263,16 @@ func (c *Crawler) Do(crawlSession *common.CrawlSession, doRequest common.DoReque
 
 // visit requests one page and enqueues its links.
 func (c *Crawler) visit(crawlSession *common.CrawlSession, req *navigation.Request, inScope bool, doRequest common.DoRequestFunc) {
+	// Hybrid navigates sequentially per target, so it holds a single slot of
+	// the target's adaptive budget. That keeps the global ceiling shared with
+	// other engines and feeds the same timeout-driven backoff accounting.
+	limiter := c.RequestLimiter()
+	release, err := limiter.Acquire(crawlSession.Ctx, crawlSession.TargetKey())
+	if err != nil {
+		return
+	}
+	defer release()
+
 	// Race Take() against the session context so the loop doesn't
 	// block on a limiter tick when the crawl has been cancelled.
 	//
@@ -303,6 +320,17 @@ func (c *Crawler) visit(crawlSession *common.CrawlSession, req *navigation.Reque
 	}
 
 	resp, err := doRequest(crawlSession, req)
+
+	// A navigation timeout halves this target's budget, mirroring the
+	// standard engine, so a consistently slow target backs off. A cancelled
+	// session context is the crawl ending, not a slow target; a throttled
+	// response is handled by the per-host backoff instead.
+	switch {
+	case err != nil && crawlSession.Ctx.Err() == nil && targetlimit.IsTimeoutError(err):
+		limiter.RecordTimeout(crawlSession.TargetKey())
+	case resp != nil && !common.IsThrottled(resp.StatusCode):
+		limiter.RecordSuccess(crawlSession.TargetKey())
+	}
 
 	if resp != nil && common.IsThrottled(resp.StatusCode) {
 		c.RecordThrottle(crawlSession.Hostname, resp.StatusCode)

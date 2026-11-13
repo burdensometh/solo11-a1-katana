@@ -255,3 +255,39 @@ func TestValidateAIProvider(t *testing.T) {
 		require.ErrorContains(t, validateOptions(opts), "-ai-record requires")
 	})
 }
+
+func TestValidateConcurrencyFlags(t *testing.T) {
+	t.Run("negative concurrency is rejected", func(t *testing.T) {
+		opts := newTestOptions()
+		opts.Concurrency = -1
+		err := validateOptions(opts)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "-concurrency cannot be negative")
+	})
+
+	t.Run("negative global concurrency is rejected", func(t *testing.T) {
+		opts := newTestOptions()
+		opts.GlobalConcurrency = -1
+		err := validateOptions(opts)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "-global-concurrency cannot be negative")
+	})
+
+	t.Run("global below per-target is rejected", func(t *testing.T) {
+		opts := newTestOptions()
+		opts.Concurrency = 8
+		opts.GlobalConcurrency = 4
+		err := validateOptions(opts)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "-global-concurrency cannot be smaller than -concurrency")
+	})
+
+	t.Run("equal or larger global concurrency is accepted", func(t *testing.T) {
+		for _, global := range []int{0, 8, 16} {
+			opts := newTestOptions()
+			opts.Concurrency = 8
+			opts.GlobalConcurrency = global
+			require.NoError(t, validateOptions(opts), "global %d should be valid", global)
+		}
+	})
+}

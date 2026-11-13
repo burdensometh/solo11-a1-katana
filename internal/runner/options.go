@@ -20,6 +20,15 @@ import (
 
 // validateOptions validates the provided options for crawler
 func validateOptions(options *types.Options) error {
+	if options.Concurrency < 0 {
+		return errkit.New("-concurrency cannot be negative")
+	}
+	if options.GlobalConcurrency < 0 {
+		return errkit.New("-global-concurrency cannot be negative")
+	}
+	if options.GlobalConcurrency > 0 && options.Concurrency > 0 && options.GlobalConcurrency < options.Concurrency {
+		return errkit.New("-global-concurrency cannot be smaller than -concurrency")
+	}
 	if options.Interactive {
 		if options.HeadlessHybrid {
 			return errkit.New("interactive mode requires pure headless mode; -hh is not supported")
