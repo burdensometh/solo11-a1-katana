@@ -316,7 +316,13 @@ Example completion stats:
 ```console
 [INF] Content similarity (simhash): 103 processed, 30 accepted, 73 filtered - 70.9% filter rate
 [INF] Crawl completed in 14s. 21 endpoints found.
+[INF] Requests: 35 enqueued = 21 output + 4 redirects + 3 failed + 7 discarded
 ```
+
+The `Requests` line accounts for every enqueued URL: each one is either
+written to output, a redirect, a failed/unparseable response, or discarded
+(out of scope, filtered path, or over a page budget). The four buckets always
+sum to the enqueued total for a completed crawl.
 
 Example running katana -
 

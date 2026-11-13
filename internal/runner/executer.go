@@ -108,6 +108,14 @@ func (r *Runner) showCompletionStats(startTime time.Time) {
 
 	// Show clean completion message
 	gologger.Info().Msgf("Crawl completed in %s. %d endpoints found.", timeStr, endpointCount)
+
+	// Break the enqueued total down by outcome so redirects, failures and
+	// discards are accounted for instead of silently missing from the output.
+	// The four buckets sum to the enqueued total for a completed crawl.
+	if snap := r.crawlerOptions.Stats().Snapshot(); snap.Enqueued > 0 {
+		gologger.Info().Msgf("Requests: %d enqueued = %d output + %d redirects + %d failed + %d discarded",
+			snap.Enqueued, snap.Output, snap.Redirect, snap.ParseFailed, snap.OutOfScope)
+	}
 }
 
 // formatDuration formats a duration in human-readable format

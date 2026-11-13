@@ -298,6 +298,7 @@ func (c *Crawler) visit(crawlSession *common.CrawlSession, req *navigation.Reque
 	if c.Options.Options.MaxDomainPages > 0 {
 		counter := c.DomainCounter(crawlSession.Hostname)
 		if counter.Add(1) > int64(c.Options.Options.MaxDomainPages) {
+			c.Options.Stats().IncOutOfScope()
 			return
 		}
 	}
@@ -309,6 +310,8 @@ func (c *Crawler) visit(crawlSession *common.CrawlSession, req *navigation.Reque
 	} else if resp != nil {
 		c.RecordSuccess(crawlSession.Hostname)
 	}
+
+	c.RecordOutcome(resp, err)
 
 	if inScope {
 		c.Output(req, resp, err)

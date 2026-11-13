@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/user"
 	"regexp"
+	"sync/atomic"
 	"time"
 
 	"github.com/projectdiscovery/fastdialer/fastdialer"
@@ -64,6 +65,10 @@ type CrawlerOptions struct {
 	Logger *slog.Logger
 	// ChromeUser is the user to use for chrome
 	ChromeUser *user.User
+
+	// stats holds the crawl outcome counters; see Stats. It is a pointer so
+	// manually constructed CrawlerOptions (tests, library use) lazily get one.
+	stats atomic.Pointer[CrawlStats]
 }
 
 // NewCrawlerOptions creates a new crawler options structure
@@ -268,6 +273,19 @@ func (c *CrawlerOptions) Close() error {
 		c.ContentSimilarity.Close()
 	}
 	return c.OutputWriter.Close()
+}
+
+// Stats returns the crawl outcome counters for this crawler, lazily creating
+// them so manually constructed CrawlerOptions work as well.
+func (c *CrawlerOptions) Stats() *CrawlStats {
+	if s := c.stats.Load(); s != nil {
+		return s
+	}
+	s := &CrawlStats{}
+	if c.stats.CompareAndSwap(nil, s) {
+		return s
+	}
+	return c.stats.Load()
 }
 
 func (c *CrawlerOptions) ValidatePath(path string) bool {

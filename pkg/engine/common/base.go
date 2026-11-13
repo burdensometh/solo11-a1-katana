@@ -163,6 +163,7 @@ func (s *Shared) Enqueue(queue *queue.Queue, navigationRequests ...*navigation.R
 		}
 
 		queue.Push(nr, s.priority(nr))
+		s.Options.Stats().IncEnqueued()
 
 		if s.Options.Options.PathClimb {
 			extractedParentURLs := utils.ExtractParentPaths(nr.URL)
@@ -196,6 +197,7 @@ func (s *Shared) Enqueue(queue *queue.Queue, navigationRequests ...*navigation.R
 					Tag:          "path-climb",
 				}
 				queue.Push(parentReq, s.priority(parentReq))
+				s.Options.Stats().IncEnqueued()
 			}
 		}
 	}
@@ -235,6 +237,25 @@ func (s *Shared) Output(navigationRequest *navigation.Request, navigationRespons
 
 	if s.Options.Options.OnResult != nil && outputErr == nil {
 		s.Options.Options.OnResult(*result)
+	}
+}
+
+// RecordOutcome classifies a finished request into exactly one crawl-stats
+// bucket: parse failure (request error or unusable response), redirect, or
+// successful output. Together with the discards counted in AcceptRequest and
+// the per-domain budget check, every enqueued request is accounted for, so
+// the four buckets sum to the enqueued total once the crawl drains.
+func (s *Shared) RecordOutcome(resp *navigation.Response, err error) {
+	stats := s.Options.Stats()
+	switch {
+	case err != nil:
+		stats.IncParseFailed()
+	case resp == nil || resp.Resp == nil || resp.Reader == nil:
+		stats.IncParseFailed()
+	case resp.IsRedirect():
+		stats.IncRedirect()
+	default:
+		stats.IncOutput()
 	}
 }
 
@@ -343,6 +364,7 @@ func (s *Shared) NewCrawlSessionWithURL(URL string) (*CrawlSession, error) {
 		return nil, err
 	}
 	queue.Push(&navigation.Request{Method: http.MethodGet, URL: URL, Depth: 0, SkipValidation: true}, 0)
+	s.Options.Stats().IncEnqueued()
 
 	if s.KnownFiles != nil {
 		navigationRequests, err := s.KnownFiles.RequestWithContext(ctx, URL)
@@ -405,14 +427,18 @@ func (s *Shared) NewCrawlSessionWithURL(URL string) (*CrawlSession, error) {
 type DoRequestFunc func(crawlSession *CrawlSession, req *navigation.Request) (*navigation.Response, error)
 
 // AcceptRequest returns the request in a popped queue item when it is a URL
-// that passes the path and scope filters.
+// that passes the path and scope filters. Rejected items are discarded without
+// being fetched and counted as out-of-scope in the crawl stats.
 func (s *Shared) AcceptRequest(crawlSession *CrawlSession, item interface{}) (req *navigation.Request, inScope, ok bool) {
 	req, ok = item.(*navigation.Request)
 	if !ok {
+		// not a navigation request: never went through a counted enqueue,
+		// so it is not counted as a discard either
 		return nil, false, false
 	}
 
 	if !utils.IsURL(req.URL) {
+		s.Options.Stats().IncOutOfScope()
 		if s.Options.Options.OnSkipURL != nil {
 			s.Options.Options.OnSkipURL(req.URL)
 		}
@@ -421,16 +447,19 @@ func (s *Shared) AcceptRequest(crawlSession *CrawlSession, item interface{}) (re
 	}
 
 	if !s.Options.ValidatePath(req.URL) {
+		s.Options.Stats().IncOutOfScope()
 		gologger.Debug().Msgf("`%v` filtered path. skipping", req.URL)
 		return nil, false, false
 	}
 
 	inScope, scopeErr := s.Options.ValidateScope(req.URL, crawlSession.Hostname)
 	if scopeErr != nil {
+		s.Options.Stats().IncOutOfScope()
 		gologger.Debug().Msgf("Error validating scope for `%v`: %v. skipping", req.URL, scopeErr)
 		return nil, false, false
 	}
 	if !req.SkipValidation && !inScope {
+		s.Options.Stats().IncOutOfScope()
 		gologger.Debug().Msgf("`%v` not in scope. skipping", req.URL)
 		return nil, false, false
 	}
@@ -504,6 +533,7 @@ func (s *Shared) Do(crawlSession *CrawlSession, doRequest DoRequestFunc) error {
 			if s.Options.Options.MaxDomainPages > 0 {
 				counter := s.DomainCounter(crawlSession.Hostname)
 				if counter.Add(1) > int64(s.Options.Options.MaxDomainPages) {
+					s.Options.Stats().IncOutOfScope()
 					return
 				}
 			}
@@ -515,6 +545,8 @@ func (s *Shared) Do(crawlSession *CrawlSession, doRequest DoRequestFunc) error {
 			} else if resp != nil {
 				s.RecordSuccess(crawlSession.Hostname)
 			}
+
+			s.RecordOutcome(resp, err)
 
 			if inScope {
 				s.Output(req, resp, err)

@@ -1,11 +1,17 @@
 package common
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/PuerkitoBio/goquery"
+	"github.com/projectdiscovery/katana/pkg/engine/parser"
 	"github.com/projectdiscovery/katana/pkg/navigation"
 	"github.com/projectdiscovery/katana/pkg/output"
 	"github.com/projectdiscovery/katana/pkg/types"
@@ -16,6 +22,7 @@ import (
 )
 
 type mockFilter struct {
+	mu   sync.Mutex
 	seen map[string]bool
 }
 
@@ -23,10 +30,12 @@ func newMockFilter() *mockFilter {
 	return &mockFilter{seen: make(map[string]bool)}
 }
 
-func (f *mockFilter) Close()                          {}
-func (f *mockFilter) UniqueContent(_ []byte) bool     { return true }
-func (f *mockFilter) IsCycle(_ string) bool            { return false }
+func (f *mockFilter) Close()                      {}
+func (f *mockFilter) UniqueContent(_ []byte) bool { return true }
+func (f *mockFilter) IsCycle(_ string) bool       { return false }
 func (f *mockFilter) UniqueURL(url string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.seen[url] {
 		return false
 	}
@@ -221,4 +230,92 @@ func TestEnqueueDomainPageBudget(t *testing.T) {
 
 		require.Equal(t, 100, q.Len())
 	})
+}
+
+// TestDoCrawlStatsAccounting runs the real crawl loop with a stubbed request
+// function and checks that every enqueued request lands in exactly one
+// crawl-stats bucket: output, redirect, parse failure, or out-of-scope discard.
+func TestDoCrawlStatsAccounting(t *testing.T) {
+	writer := &mockWriter{}
+	// fqdn field scope: only the root hostname itself is in scope, so the
+	// other.com link discovered below is dropped at enqueue time and must NOT
+	// appear in the stats at all (it is never enqueued).
+	scopeManager, err := scope.NewManager(nil, nil, "fqdn", false)
+	require.NoError(t, err)
+
+	crawlerOpts := &types.CrawlerOptions{
+		Options: &types.Options{
+			MaxDepth:    10,
+			Strategy:    "depth-first",
+			Concurrency: 4,
+		},
+		OutputWriter: writer,
+		UniqueFilter: newMockFilter(),
+		ScopeManager: scopeManager,
+		// default denylist active: .png URLs are discarded when popped
+		ExtensionsValidator: extensions.NewValidator(nil, nil, false),
+		Parser:              parser.NewResponseParser(),
+	}
+	shared, err := NewShared(crawlerOpts)
+	require.NoError(t, err)
+
+	q, err := queue.New("depth-first")
+	require.NoError(t, err)
+	session := &CrawlSession{
+		Ctx:      context.Background(),
+		Queue:    q,
+		Hostname: "example.com",
+	}
+
+	shared.Enqueue(q,
+		&navigation.Request{Method: http.MethodGet, URL: "https://example.com/ok", Depth: 1, RootHostname: "example.com"},
+		&navigation.Request{Method: http.MethodGet, URL: "https://example.com/redirect", Depth: 1, RootHostname: "example.com"},
+		&navigation.Request{Method: http.MethodGet, URL: "https://example.com/fail", Depth: 1, RootHostname: "example.com"},
+		&navigation.Request{Method: http.MethodGet, URL: "https://example.com/empty", Depth: 1, RootHostname: "example.com"},
+		&navigation.Request{Method: http.MethodGet, URL: "https://example.com/image.png", Depth: 1, RootHostname: "example.com"},
+	)
+
+	makeResp := func(t *testing.T, req *navigation.Request, status int, html string) *navigation.Response {
+		parsed, err := url.Parse(req.URL)
+		require.NoError(t, err)
+		doc, err := goquery.NewDocumentFromReader(strings.NewReader(html))
+		require.NoError(t, err)
+		return &navigation.Response{
+			Resp:         &http.Response{StatusCode: status, Header: http.Header{}, Request: &http.Request{URL: parsed}},
+			Reader:       doc,
+			StatusCode:   status,
+			Depth:        req.Depth + 1,
+			RootHostname: "example.com",
+		}
+	}
+
+	doRequest := func(_ *CrawlSession, req *navigation.Request) (*navigation.Response, error) {
+		switch req.URL {
+		case "https://example.com/ok":
+			// discovers /ok2 (in scope, enqueued) and other.com (out of scope, dropped at enqueue)
+			return makeResp(t, req, 200, `<html><body><a href="https://example.com/ok2">ok2</a><a href="https://other.com/ext">ext</a></body></html>`), nil
+		case "https://example.com/ok2":
+			return makeResp(t, req, 200, `<html><body>ok2</body></html>`), nil
+		case "https://example.com/redirect":
+			return makeResp(t, req, 302, `<html></html>`), nil
+		case "https://example.com/fail":
+			return nil, errors.New("connection refused")
+		case "https://example.com/empty":
+			return &navigation.Response{}, nil
+		default:
+			t.Errorf("unexpected fetch of %s (should have been discarded before request)", req.URL)
+			return nil, errors.New("unexpected fetch")
+		}
+	}
+
+	require.NoError(t, shared.Do(session, doRequest))
+
+	snap := crawlerOpts.Stats().Snapshot()
+	require.Equal(t, int64(6), snap.Enqueued, "5 enqueued up front + /ok2 discovered; other.com dropped before enqueue")
+	require.Equal(t, int64(2), snap.Output, "/ok and /ok2")
+	require.Equal(t, int64(1), snap.Redirect, "/redirect")
+	require.Equal(t, int64(2), snap.ParseFailed, "/fail and /empty")
+	require.Equal(t, int64(1), snap.OutOfScope, "/image.png filtered by extension")
+	require.Equal(t, snap.Enqueued, snap.Processed(),
+		"output+redirect+parseFailed+outOfScope must equal enqueued")
 }
